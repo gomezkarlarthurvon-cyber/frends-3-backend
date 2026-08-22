@@ -10,8 +10,8 @@ class FRENDSRoutingEngine:
         """Initializes the engine and loads the pre-built street network."""
         print(f"⏳ Initializing FRENDS Routing Engine...")
         try:
-            print("Loading pre-processed map data...")
-            with open("metro_manila.pkl", "rb") as f:
+            print(f"Loading pre-processed map data from {graph_file}...")
+            with open(graph_file, "rb") as f:
                 self.graph = pickle.load(f)
             print("✅ Map loaded successfully from Pickle!")
             
@@ -164,16 +164,10 @@ class FRENDSRoutingEngine:
             return {"status": "error", "message": f"Error snapping coordinates: {e}"}
 
         def get_edge_weight(u, v, data):
-            if isinstance(data, dict):
-                weights = []
-                for k, edge in data.items():
-                    if isinstance(edge, dict):
-                        w = edge.get('current_weight')
-                        if w is None or w == float('inf'):
-                            w = edge.get('travel_time', edge.get('baseline_time', edge.get('length', 1.0)))
-                        weights.append(w)
-                return min(weights) if weights else 1.0
-            return 1.0
+            w = data.get('current_weight')
+            if w is None or w == float('inf'):
+                w = data.get('travel_time', data.get('baseline_time', data.get('length', 1.0)))
+            return float(w)
 
         path = None
         base_total_time = 0.0
@@ -209,7 +203,7 @@ class FRENDSRoutingEngine:
                 elif self.graph.has_edge(v, u): edge_data = self.graph.get_edge_data(v, u)
                 else: continue
 
-                edge_attrs = edge_data[0] if (isinstance(edge_data, dict) and 0 in edge_data) else edge_data
+                edge_attrs = next(iter(edge_data.values())) if isinstance(edge_data, dict) else edge_data
                 
                 raw_length = edge_attrs.get('length', 0.0)
                 seg_length = float(raw_length[0] if isinstance(raw_length, list) else raw_length)

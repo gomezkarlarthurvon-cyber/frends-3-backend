@@ -11,7 +11,7 @@ class FRENDSRoutingEngine:
         print(f"⏳ Initializing FRENDS Routing Engine...")
         try:
             print("Loading pre-processed map data...")
-            with open("metro_manila_full.pkl", "rb") as f:
+            with open("metro_manila.pkl", "rb") as f:
                 self.graph = pickle.load(f)
             print("✅ Map loaded successfully from Pickle!")
             

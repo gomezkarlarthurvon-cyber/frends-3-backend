@@ -116,6 +116,12 @@ def health_check():
     )
 
 
+@app.route("/ping", methods=["GET"])
+def ping():
+    """Endpoint for UptimeRobot to prevent Render from sleeping."""
+    return jsonify({"status": "awake", "message": "FRENDS routing engine is online!"}), 200
+
+
 @app.route("/api/route", methods=["POST"])
 def get_dynamic_route():
     data = request.get_json()

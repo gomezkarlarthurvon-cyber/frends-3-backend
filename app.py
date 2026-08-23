@@ -88,7 +88,7 @@ def setup_firebase_listeners():
                     )
 
     try:
-        db.reference("iot_nodes").listen(flood_stream_handler)
+        db.reference("nodes").listen(flood_stream_handler)
         print("🛰️ Firebase listeners active.")
     except Exception as e:
         print(f"⚠️ Could not attach listeners: {e}")

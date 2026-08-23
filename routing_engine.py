@@ -95,20 +95,27 @@ class FRENDSRoutingEngine:
                 if not isinstance(node_container, dict): continue
                 water_level, lat, lng = 0, None, None
                 
-                if 'waterLevel' in node_container:
-                    water_level = float(node_container.get('waterLevel', 0)) 
-                    lat = float(node_container.get('lat', 0))
-                    lng = float(node_container.get('lng', 0))
+                # 1. Grab all push IDs (keys starting with '-') and sort them chronologically
+                push_keys = sorted([k for k in node_container.keys() if str(k).startswith('-')])
+                
+                if push_keys:
+                    # Grab the absolute newest reading
+                    latest_key = push_keys[-1]
+                    latest_data = node_container[latest_key]
+                    
+                    if isinstance(latest_data, dict):
+                        # Handle both 'waterLevel' and 'depth' depending on your hardware payload
+                        water_level = float(latest_data.get('waterLevel', latest_data.get('depth', 0)))
+                        
+                        # Grab coords from the push data, or fallback to the root node container
+                        lat = float(latest_data.get('lat', node_container.get('lat', 0)))
+                        # Handle both 'lng' and 'lon' naming conventions
+                        lng = float(latest_data.get('lng', latest_data.get('lon', node_container.get('lng', node_container.get('lon', 0)))))
                 else:
-                    try:
-                        latest_push_key = list(node_container.keys())[-1]
-                        latest_data = node_container[latest_push_key]
-                        if isinstance(latest_data, dict):
-                            water_level = float(latest_data.get('waterLevel', 0))
-                            lat = float(latest_data.get('lat') or node_container.get('lat', 0))
-                            lng = float(latest_data.get('lng') or node_container.get('lng', 0))
-                    except Exception:
-                        continue
+                    # Fallback if testing with a flat structure
+                    water_level = float(node_container.get('waterLevel', node_container.get('depth', 0)))
+                    lat = float(node_container.get('lat', 0))
+                    lng = float(node_container.get('lng', node_container.get('lon', 0)))
                         
                 if water_level >= max_safe_depth and lat and lng:
                     flood_points.append((lat, lng))

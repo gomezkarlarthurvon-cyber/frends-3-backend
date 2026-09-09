@@ -3,23 +3,31 @@ import networkx as nx
 import requests
 import random
 import pickle
+import heapq
 from math import radians, cos, sin, asin, sqrt
 
 class FRENDSRoutingEngine:
-    def __init__(self, graph_file="metro_manila.pkl"):
-        """Initializes the engine and loads the pre-built street network."""
-        print(f"⏳ Initializing FRENDS Routing Engine...")
+    def __init__(self, graph_file="metro_manila_ch.pkl"):
+        """Initializes the engine and loads the pre-processed CH/CCH network data."""
+        print(f"⏳ Initializing FRENDS CCH Routing Engine...")
         try:
-            print(f"Loading pre-processed map data from {graph_file}...")
+            print(f"Loading hierarchical map data from {graph_file}...")
             with open(graph_file, "rb") as f:
-                self.graph = pickle.load(f)
-            print("✅ Map loaded successfully from Pickle!")
-            
+                saved_data = pickle.load(f)
+                
+            # Support both raw graphs and pre-contracted tuple structures (graph, node_ranks)
+            if isinstance(saved_data, tuple):
+                self.graph, self.node_ranks = saved_data
+            else:
+                self.graph = saved_data
+                self.node_ranks = {n: data.get('ch_rank', i) for i, (n, data) in enumerate(self.graph.nodes(data=True))}
+                
             self.node_coords = {n: (data['y'], data['x']) for n, data in self.graph.nodes(data=True)}
-            print(f"✅ Map loaded successfully! Loaded {len(self.graph.nodes)} intersection nodes.")
+            print(f"✅ CCH Map loaded successfully! Loaded {len(self.graph.nodes)} nodes with hierarchical ranks.")
         except Exception as e:
             print(f"❌ Failed to load map data: {e}")
             self.graph = None
+            self.node_ranks = {}
 
     def get_tomtom_traffic_multiplier(self, lat, lon, api_key):
         """Pings TomTom API for live traffic flow at a specific coordinate."""
@@ -43,48 +51,30 @@ class FRENDSRoutingEngine:
         return random.choice([1.0, 1.0, 1.8, 3.0])
 
     def haversine_distance(self, lat1, lon1, lat2, lon2):
-        """Calculate distance between two points in meters using Haversine formula."""
         lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
         dlat = lat2 - lat1
         dlon = lon2 - lon1
         a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
         c = 2 * asin(sqrt(a))
-        r = 6371000  # Earth's radius in meters
-        return c * r
+        return c * 6371000
 
     def point_to_line_distance(self, px, py, x1, y1, x2, y2):
-        """Calculate perpendicular distance from point (px, py) to line segment (x1,y1)-(x2,y2)."""
-        # Convert to meters for more accurate calculation
         dx = x2 - x1
         dy = y2 - y1
         if dx == 0 and dy == 0:
             return self.haversine_distance(py, px, y1, x1)
-        
         t = max(0, min(1, ((px - x1) * dx + (py - y1) * dy) / (dx*dx + dy*dy)))
-        closest_x = x1 + t * dx
-        closest_y = y1 + t * dy
-        return self.haversine_distance(py, px, closest_y, closest_x)
+        return self.haversine_distance(py, px, y1 + t * dy, x1 + t * dx)
 
     def compute_route(self, origin_lat, origin_lon, dest_lat, dest_lon, vehicle_layer="LOW", api_key=None, flood_data=None):
-        print(f"\n🗺️ Route requested: ({origin_lat}, {origin_lon}) -> ({dest_lat}, {dest_lon})")
+        print(f"\n🗺️ CCH Route requested: ({origin_lat}, {origin_lon}) -> ({dest_lat}, {dest_lon})")
 
         if self.graph is None:
-            return {"status": "error", "message": "Backend Error: No valid OSMnx graph loaded."}
+            return {"status": "error", "message": "Backend Error: No valid CCH graph loaded."}
 
-        # 1. SPATIAL BOUNDING BOX (Shrink the map BEFORE scanning for floods!)
-        buffer = 0.08 
-        min_lat, max_lat = min(origin_lat, dest_lat) - buffer, max(origin_lat, dest_lat) + buffer
-        min_lon, max_lon = min(origin_lon, dest_lon) - buffer, max(origin_lon, dest_lon) + buffer
-
-        def filter_node_bbox(n):
-            lat, lon = self.node_coords[n]
-            return min_lat <= lat <= max_lat and min_lon <= lon <= max_lon
-            
-        local_graph = nx.subgraph_view(self.graph, filter_node=filter_node_bbox)
-
-        # 2. BUILD GEOMETRY-AWARE BLAST RADIUS FIREWALL
+        # 1. BUILD GEOMETRY-AWARE BLAST RADIUS FIREWALL FOR FLOODS
         flooded_edges_set = set()
-        BLAST_RADIUS = 60  # 60 meters easily covers wide dual carriageways
+        BLAST_RADIUS = 60  # meters
         
         if flood_data:
             limits = {"LOW": 15, "Low (Sedan / Hatchback)": 15, "MID": 30, "Mid (SUV / Pick-up)": 30, "HIGH": 50, "High (Truck / Bus)": 50}
@@ -93,77 +83,39 @@ class FRENDSRoutingEngine:
             
             for node_id, node_container in flood_data.items():
                 if not isinstance(node_container, dict): continue
-                water_level, lat, lng = 0, None, None
-                
-                # 1. Grab all push IDs (keys starting with '-') and sort them chronologically
                 push_keys = sorted([k for k in node_container.keys() if str(k).startswith('-')])
-                
                 if push_keys:
-                    # Grab the absolute newest reading
-                    latest_key = push_keys[-1]
-                    latest_data = node_container[latest_key]
-                    
-                    if isinstance(latest_data, dict):
-                        # Handle both 'waterLevel' and 'depth' depending on your hardware payload
-                        water_level = float(latest_data.get('waterLevel', latest_data.get('depth', 0)))
-                        
-                        # Grab coords from the push data, or fallback to the root node container
-                        lat = float(latest_data.get('lat', node_container.get('lat', 0)))
-                        # Handle both 'lng' and 'lon' naming conventions
-                        lng = float(latest_data.get('lng', latest_data.get('lon', node_container.get('lng', node_container.get('lon', 0)))))
+                    latest_data = node_container[push_keys[-1]]
+                    water_level = float(latest_data.get('waterLevel', latest_data.get('depth', 0)))
+                    lat = float(latest_data.get('lat', node_container.get('lat', 0)))
+                    lng = float(latest_data.get('lng', node_container.get('lon', node_container.get('lng', node_container.get('lon', 0)))))
                 else:
-                    # Fallback if testing with a flat structure
                     water_level = float(node_container.get('waterLevel', node_container.get('depth', 0)))
                     lat = float(node_container.get('lat', 0))
                     lng = float(node_container.get('lng', node_container.get('lon', 0)))
                         
                 if water_level >= max_safe_depth and lat and lng:
                     flood_points.append((lat, lng))
-                    print(f"🌊 Flooded node detected at ({lat}, {lng}) - Depth: {water_level}cm")
             
             if flood_points:
-                print(f"🌊 Scanning {local_graph.number_of_edges()} local road segments for blast radius overlap...")
-                
-                # Iterate ONLY over the tiny local graph, not the whole city
-                for u, v, k, data in local_graph.edges(keys=True, data=True):
+                for u, v, k, data in self.graph.edges(keys=True, data=True):
                     is_flooded = False
-                    
-                    # Extract the true curve geometry of the road
                     pts = data.get('geometry', None)
-                    if pts:
-                        coords = list(pts.coords)
-                    else:
-                        node_u_data, node_v_data = self.graph.nodes[u], self.graph.nodes[v]
-                        coords = [(node_u_data['x'], node_u_data['y']), (node_v_data['x'], node_v_data['y'])]
+                    coords = list(pts.coords) if pts else [(self.node_coords[u][1], self.node_coords[u][0]), (self.node_coords[v][1], self.node_coords[v][0])]
                     
-                    # Scan every segment of the road's curve
                     for flood_lat, flood_lon in flood_points:
                         for i in range(len(coords) - 1):
-                            lon1, lat1 = coords[i]
-                            lon2, lat2 = coords[i+1]
-                            
-                            dist = self.point_to_line_distance(flood_lon, flood_lat, lon1, lat1, lon2, lat2)
-                            
-                            if dist <= BLAST_RADIUS:
+                            if self.point_to_line_distance(flood_lon, flood_lat, coords[i][0], coords[i][1], coords[i+1][0], coords[i+1][1]) <= BLAST_RADIUS:
                                 is_flooded = True
                                 break
-                        if is_flooded:
-                            break
+                        if is_flooded: break
                             
                     if is_flooded:
-                        # Block both directions to prevent wrong-way bypasses
                         flooded_edges_set.add((u, v))
                         flooded_edges_set.add((v, u))
-                        
-                print(f"🌊 Firewall complete: Blocked {len(flooded_edges_set)} directional road segments.")
+                print(f"🌊 CCH Firewall: Blocked {len(flooded_edges_set) // 2} road segments due to flooding.")
 
-        # 3. APPLY FILTER
-        def filter_edge_strict(u, v, k):
-            return (u, v) not in flooded_edges_set 
-        
-        safe_graph = nx.subgraph_view(local_graph, filter_edge=filter_edge_strict)
-
-        # 4. SNAP & ROUTE
+        # 2. SNAP COORDINATES TO GRAPH NODES
         try:
             orig_node = ox.nearest_nodes(self.graph, X=origin_lon, Y=origin_lat)
             dest_node = ox.nearest_nodes(self.graph, X=dest_lon, Y=dest_lat)
@@ -171,28 +123,98 @@ class FRENDSRoutingEngine:
             return {"status": "error", "message": f"Error snapping coordinates: {e}"}
 
         def get_edge_weight(u, v, data):
+            if (u, v) in flooded_edges_set:
+                return float('inf')
             w = data.get('current_weight')
             if w is None or w == float('inf'):
                 w = data.get('travel_time', data.get('baseline_time', data.get('length', 1.0)))
             return float(w)
 
-        path = None
-        base_total_time = 0.0
+        # 3. CCH UPWARD BIDIRECTIONAL SEARCH QUERY
+        # Forward search moves only to higher-ranked neighbors; Backward search from destination also moves to higher-ranked neighbors.
+        def run_cch_search(source, target):
+            dist_fwd = {source: 0.0}
+            dist_bwd = {target: 0.0}
+            parent_fwd = {}
+            parent_bwd = {}
+            
+            pq_fwd = [(0.0, source)]
+            pq_bwd = [(0.0, target)]
+            
+            settled_fwd = {}
+            settled_bwd = {}
+            mu = float('inf')
+            best_meeting_node = None
 
-        try:
-            base_total_time, path = nx.bidirectional_dijkstra(
-                safe_graph, source=orig_node, target=dest_node, weight=get_edge_weight
-            )
-        except nx.NetworkXNoPath:
-            # NO FALLBACK ALLOWED! If it fails here, it is genuinely flooded.
-            return {"status": "error", "message": f"No safe route available for {vehicle_layer} clearance. Destination is isolated by flooding."}
-        except Exception as e:
-            return {"status": "error", "message": f"Route calculation exception: {e}"}
+            while pq_fwd or pq_bwd:
+                # Expand Forward Queue (Upward only)
+                if pq_fwd:
+                    cost_u, u = heapq.heappop(pq_fwd)
+                    if u not in settled_fwd:
+                        settled_fwd[u] = cost_u
+                        if u in settled_bwd and cost_u + settled_bwd[u] < mu:
+                            mu = cost_u + settled_bwd[u]
+                            best_meeting_node = u
 
-        if not path: 
-            return {"status": "error", "message": "Failed to generate path array."}
+                        rank_u = self.node_ranks.get(u, 0)
+                        for v in self.graph.successors(u):
+                            if self.node_ranks.get(v, 0) > rank_u: # Strict upward condition
+                                edge_data = self.graph.get_edge_data(u, v)
+                                w = min(get_edge_weight(u, v, d) for d in edge_data.values())
+                                if w != float('inf'):
+                                    nd = cost_u + w
+                                    if nd < dist_fwd.get(v, float('inf')):
+                                        dist_fwd[v] = nd
+                                        parent_fwd[v] = u
+                                        heapq.heappush(pq_fwd, (nd, v))
 
-        # 5. COMPILE ROUTE PAYLOAD
+                # Expand Backward Queue (Upward from target)
+                if pq_bwd:
+                    cost_v, v = heapq.heappop(pq_bwd)
+                    if v not in settled_bwd:
+                        settled_bwd[v] = cost_v
+                        if v in settled_fwd and cost_v + settled_fwd[v] < mu:
+                            mu = cost_v + settled_fwd[v]
+                            best_meeting_node = v
+
+                        rank_v = self.node_ranks.get(v, 0)
+                        # In the backward search, we traverse incoming edges whose source has a higher rank
+                        for u in self.graph.predecessors(v):
+                            if self.node_ranks.get(u, 0) > rank_v:
+                                edge_data = self.graph.get_edge_data(u, v)
+                                w = min(get_edge_weight(u, v, d) for d in edge_data.values())
+                                if w != float('inf'):
+                                    nd = cost_v + w
+                                    if nd < dist_bwd.get(u, float('inf')):
+                                        dist_bwd[u] = nd
+                                        parent_bwd[u] = v
+                                        heapq.heappush(pq_bwd, (nd, u))
+
+            if mu == float('inf') or best_meeting_node is None:
+                return None, float('inf')
+
+            # Reconstruct path from source -> meeting_node -> target
+            path = []
+            curr = best_meeting_node
+            while curr in parent_fwd:
+                path.append(curr)
+                curr = parent_fwd[curr]
+            path.append(source)
+            path.reverse()
+
+            curr = best_meeting_node
+            while curr in parent_bwd:
+                curr = parent_bwd[curr]
+                path.append(curr)
+
+            return path, mu
+
+        path, base_total_time = run_cch_search(orig_node, dest_node)
+
+        if not path:
+            return {"status": "error", "message": f"No safe CCH route available for {vehicle_layer} clearance. Area isolated by flood or network cut."}
+
+        # 4. COMPILE ROUTE PAYLOAD & UNPACK SHORTCUTS IF NEEDED
         try:
             route_coords, route_segments = [], []
             total_distance, live_total_time = 0.0, 0.0
@@ -205,16 +227,14 @@ class FRENDSRoutingEngine:
                 u, v = path[i], path[i+1]
                 node_u, node_v = self.graph.nodes[u], self.graph.nodes[v]
 
-                edge_data = {}
-                if self.graph.has_edge(u, v): edge_data = self.graph.get_edge_data(u, v)
-                elif self.graph.has_edge(v, u): edge_data = self.graph.get_edge_data(v, u)
-                else: continue
+                edge_data = self.graph.get_edge_data(u, v, default=None)
+                if not edge_data:
+                    edge_data = self.graph.get_edge_data(v, u, default={})
 
                 edge_attrs = next(iter(edge_data.values())) if isinstance(edge_data, dict) else edge_data
                 
                 raw_length = edge_attrs.get('length', 0.0)
                 seg_length = float(raw_length[0] if isinstance(raw_length, list) else raw_length)
-                
                 total_distance += seg_length
                 
                 raw_time = edge_attrs.get('baseline_time', edge_attrs.get('travel_time', seg_length / 8.33))
@@ -224,7 +244,6 @@ class FRENDSRoutingEngine:
                     current_multiplier = self.get_tomtom_traffic_multiplier(node_u['y'], node_u['x'], api_key)
 
                 live_total_time += (seg_time * current_multiplier)
-
                 segment_color = "#FF0000" if current_multiplier >= 2.5 else "#FFA500" if current_multiplier >= 1.5 else "#3388ff"
 
                 segment_coords = []
@@ -247,4 +266,4 @@ class FRENDSRoutingEngine:
                 "time": float(final_eta_seconds)
             }
         except Exception as e:
-            return {"status": "error", "message": f"Failed compiling payload: {e}"}
+            return {"status": "error", "message": f"Failed compiling CCH payload: {e}"}

@@ -7,7 +7,7 @@ import heapq
 from math import radians, cos, sin, asin, sqrt
 
 class FRENDSRoutingEngine:
-    def __init__(self, graph_file="metro_manila_ch.pkl"):
+    def __init__(self, graph_file="metro_manila.pkl"):
         """Initializes the engine and loads the pre-processed CH/CCH network data."""
         print(f"⏳ Initializing FRENDS CCH Routing Engine...")
         try:

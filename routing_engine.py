@@ -6,7 +6,7 @@ import random
 from math import radians, cos, sin, asin, sqrt
 
 class FRENDSRoutingEngine:
-    def __init__(self, npz_file="metro_manila_csr.npz"):
+    def __init__(self, npz_file="metro_manila.npz"):
         print(f"⏳ Initializing Flat-Array Routing Engine...")
         try:
             data = np.load(npz_file)

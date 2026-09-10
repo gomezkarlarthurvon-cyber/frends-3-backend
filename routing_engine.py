@@ -6,7 +6,7 @@ import pickle
 from math import radians, cos, sin, asin, sqrt
 
 class FRENDSRoutingEngine:
-    def __init__(self, graph_file="metro_manila.pkl"):
+    def __init__(self, graph_file="metro_manila_lite.pkl"):
         """Initializes the engine and loads the pre-built street network."""
         print(f"⏳ Initializing FRENDS Routing Engine...")
         try:

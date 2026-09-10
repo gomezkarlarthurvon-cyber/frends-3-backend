@@ -1,59 +1,32 @@
-import osmnx as ox
+import pickle
 import networkx as nx
-import numpy as np
 
-def build_full_metro_map():
-    ox.settings.log_console = True
-    ox.settings.use_cache = True
+def prune_graph_for_render(input_file="metro_manila.pkl", output_file="metro_manila_lite.pkl"):
+    print(f"Loading heavy graph from {input_file}... (This may take a moment)")
+    with open(input_file, "rb") as f:
+        G = pickle.load(f)
 
-    place_name = "National Capital Region, Philippines"
-    
-    print(f"⏳ Downloading street network for: {place_name}...")
-    print("Wait lang, medyo matagal siguro 'to hehe")
+    print(f"Original graph loaded: {len(G.nodes)} nodes, {len(G.edges)} edges.")
+    print("Pruning useless metadata to save RAM...")
 
-    G = ox.graph_from_place(place_name, network_type='drive')
+    # 1. Prune Nodes (Keep ONLY x and y)
+    for n, data in G.nodes(data=True):
+        keys_to_delete = [k for k in data.keys() if k not in ['x', 'y']]
+        for k in keys_to_delete:
+            del data[k]
 
-    print(f"✅ Download complete! Loaded {len(G.nodes)} nodes and {len(G.edges)} edges.")
-    print("📦 Extracting topology and packing into flat NumPy arrays...")
+    # 2. Prune Edges (Keep ONLY length, travel_time, and geometry)
+    for u, v, k, data in G.edges(keys=True, data=True):
+        keys_to_delete = [k for k in data.keys() if k not in ['length', 'travel_time', 'geometry']]
+        for k in keys_to_delete:
+            del data[k]
 
-    nodes = list(G.nodes())
-    node_to_idx = {node: i for i, node in enumerate(nodes)}
-    n_nodes = len(nodes)
+    print("Saving highly compressed lite graph...")
+    # Using HIGHEST_PROTOCOL compresses it even further
+    with open(output_file, "wb") as f:
+        pickle.dump(G, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-    lats = np.zeros(n_nodes, dtype=np.float32)
-    lons = np.zeros(n_nodes, dtype=np.float32)
-    ranks = np.zeros(n_nodes, dtype=np.int32)
-
-    for i, node in enumerate(nodes):
-        data = G.nodes[node]
-        lats[i] = data.get('y', 0.0)
-        lons[i] = data.get('x', 0.0)
-        ranks[i] = data.get('ch_rank', i)
-
-    indptr = [0]
-    indices = []
-    baseline_weights = []
-
-    for u in nodes:
-        neighbors = list(G.successors(u)) if G.is_directed() else list(G.neighbors(u))
-        for v in neighbors:
-            edge_data = G.get_edge_data(u, v)
-            w = min(d.get('travel_time', d.get('length', 1.0)) for d in edge_data.values())
-            indices.append(node_to_idx[v])
-            baseline_weights.append(float(w))
-        indptr.append(len(indices))
-
-    np.savez_compressed(
-        "metro_manila.npz",
-        indptr=np.array(indptr, dtype=np.int32),
-        indices=np.array(indices, dtype=np.int32),
-        weights=np.array(baseline_weights, dtype=np.float32),
-        lats=lats,
-        lons=lons,
-        ranks=ranks
-    )
-
-    print("🎉 Success! Optimized flat-array map saved as metro_manila.npz")
+    print(f"✅ Success! Upload '{output_file}' to Render.")
 
 if __name__ == "__main__":
-    build_full_metro_map()
+    prune_graph_for_render()

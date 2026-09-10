@@ -375,7 +375,8 @@ class FRENDSRoutingEngine:
 
             multiplier = 1.0
             if api_key:
-                cache_key = (round(nodes[u][4], 4), round(nodes[u][1], 4))
+                # FIXED TYPO HERE: Changed nodes[u][4] back to nodes[u][0]
+                cache_key = (round(nodes[u][0], 4), round(nodes[u][1], 4))
                 if cache_key not in traffic_cache:
                     traffic_cache[cache_key] = self.get_tomtom_traffic_multiplier(nodes[u][0], nodes[u][1], api_key)
                 multiplier = traffic_cache[cache_key]

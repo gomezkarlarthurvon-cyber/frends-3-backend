@@ -22,7 +22,6 @@ class FRENDSRoutingEngine:
             self.graph = None
 
     def get_tomtom_traffic_multiplier(self, lat, lon, api_key):
-        """Pings TomTom API for live traffic flow at a specific coordinate."""
         url = "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json"
         params = {'key': api_key, 'point': f"{lat},{lon}"}
         try:
@@ -43,18 +42,15 @@ class FRENDSRoutingEngine:
         return random.choice([1.0, 1.0, 1.8, 3.0])
 
     def haversine_distance(self, lat1, lon1, lat2, lon2):
-        """Calculate distance between two points in meters using Haversine formula."""
         lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
         dlat = lat2 - lat1
         dlon = lon2 - lon1
         a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
         c = 2 * asin(sqrt(a))
-        r = 6371000  # Earth's radius in meters
+        r = 6371000 
         return c * r
 
     def point_to_line_distance(self, px, py, x1, y1, x2, y2):
-        """Calculate perpendicular distance from point (px, py) to line segment (x1,y1)-(x2,y2)."""
-        # Convert to meters for more accurate calculation
         dx = x2 - x1
         dy = y2 - y1
         if dx == 0 and dy == 0:
@@ -71,20 +67,27 @@ class FRENDSRoutingEngine:
         if self.graph is None:
             return {"status": "error", "message": "Backend Error: No valid OSMnx graph loaded."}
 
-        # 1. SPATIAL BOUNDING BOX (Shrink the map BEFORE scanning for floods!)
+        # 1. FLOAT SAFETY CASTING (Prevents silent math crashes from JSON strings)
+        try:
+            origin_lat, origin_lon = float(origin_lat), float(origin_lon)
+            dest_lat, dest_lon = float(dest_lat), float(dest_lon)
+        except (ValueError, TypeError):
+            return {"status": "error", "message": "Invalid coordinates provided to backend."}
+
+        # 2. SPATIAL BOUNDING BOX
         buffer = 0.08 
         min_lat, max_lat = min(origin_lat, dest_lat) - buffer, max(origin_lat, dest_lat) + buffer
         min_lon, max_lon = min(origin_lon, dest_lon) - buffer, max(origin_lon, dest_lon) + buffer
 
         def filter_node_bbox(n):
-            lat, lon = self.node_coords[n]
+            lat, lon = self.node_coords.get(n, (0,0))
             return min_lat <= lat <= max_lat and min_lon <= lon <= max_lon
             
         local_graph = nx.subgraph_view(self.graph, filter_node=filter_node_bbox)
 
-        # 2. BUILD GEOMETRY-AWARE BLAST RADIUS FIREWALL
+        # 3. BUILD GEOMETRY-AWARE BLAST RADIUS FIREWALL
         flooded_edges_set = set()
-        BLAST_RADIUS = 60  # 60 meters easily covers wide dual carriageways
+        BLAST_RADIUS = 60  
         
         if flood_data:
             limits = {"LOW": 15, "Low (Sedan / Hatchback)": 15, "MID": 30, "Mid (SUV / Pick-up)": 30, "HIGH": 50, "High (Truck / Bus)": 50}
@@ -95,27 +98,25 @@ class FRENDSRoutingEngine:
                 if not isinstance(node_container, dict): continue
                 water_level, lat, lng = 0, None, None
                 
-                # 1. Grab all push IDs (keys starting with '-') and sort them chronologically
                 push_keys = sorted([k for k in node_container.keys() if str(k).startswith('-')])
                 
                 if push_keys:
-                    # Grab the absolute newest reading
                     latest_key = push_keys[-1]
                     latest_data = node_container[latest_key]
-                    
                     if isinstance(latest_data, dict):
-                        # Handle both 'waterLevel' and 'depth' depending on your hardware payload
                         water_level = float(latest_data.get('waterLevel', latest_data.get('depth', 0)))
                         
-                        # Grab coords from the push data, or fallback to the root node container
-                        lat = float(latest_data.get('lat', node_container.get('lat', 0)))
-                        # Handle both 'lng' and 'lon' naming conventions
-                        lng = float(latest_data.get('lng', latest_data.get('lon', node_container.get('lng', node_container.get('lon', 0)))))
+                        # SAFE EXTRACT: Prevents float(None) crashes
+                        lat_val = latest_data.get('lat', node_container.get('lat'))
+                        lng_val = latest_data.get('lng', latest_data.get('lon', node_container.get('lng', node_container.get('lon'))))
+                        if lat_val and lng_val:
+                            lat, lng = float(lat_val), float(lng_val)
                 else:
-                    # Fallback if testing with a flat structure
                     water_level = float(node_container.get('waterLevel', node_container.get('depth', 0)))
-                    lat = float(node_container.get('lat', 0))
-                    lng = float(node_container.get('lng', node_container.get('lon', 0)))
+                    lat_val = node_container.get('lat')
+                    lng_val = node_container.get('lng', node_container.get('lon'))
+                    if lat_val and lng_val:
+                        lat, lng = float(lat_val), float(lng_val)
                         
                 if water_level >= max_safe_depth and lat and lng:
                     flood_points.append((lat, lng))
@@ -123,12 +124,8 @@ class FRENDSRoutingEngine:
             
             if flood_points:
                 print(f"🌊 Scanning {local_graph.number_of_edges()} local road segments for blast radius overlap...")
-                
-                # Iterate ONLY over the tiny local graph, not the whole city
                 for u, v, k, data in local_graph.edges(keys=True, data=True):
                     is_flooded = False
-                    
-                    # Extract the true curve geometry of the road
                     pts = data.get('geometry', None)
                     if pts:
                         coords = list(pts.coords)
@@ -136,34 +133,29 @@ class FRENDSRoutingEngine:
                         node_u_data, node_v_data = self.graph.nodes[u], self.graph.nodes[v]
                         coords = [(node_u_data['x'], node_u_data['y']), (node_v_data['x'], node_v_data['y'])]
                     
-                    # Scan every segment of the road's curve
                     for flood_lat, flood_lon in flood_points:
                         for i in range(len(coords) - 1):
                             lon1, lat1 = coords[i]
                             lon2, lat2 = coords[i+1]
-                            
                             dist = self.point_to_line_distance(flood_lon, flood_lat, lon1, lat1, lon2, lat2)
-                            
                             if dist <= BLAST_RADIUS:
                                 is_flooded = True
                                 break
-                        if is_flooded:
-                            break
+                        if is_flooded: break
                             
                     if is_flooded:
-                        # Block both directions to prevent wrong-way bypasses
                         flooded_edges_set.add((u, v))
                         flooded_edges_set.add((v, u))
                         
                 print(f"🌊 Firewall complete: Blocked {len(flooded_edges_set)} directional road segments.")
 
-        # 3. APPLY FILTER
+        # 4. APPLY FILTER
         def filter_edge_strict(u, v, k):
             return (u, v) not in flooded_edges_set 
         
         safe_graph = nx.subgraph_view(local_graph, filter_edge=filter_edge_strict)
 
-        # 4. SNAP & ROUTE
+        # 5. SNAP & ROUTE
         try:
             orig_node = ox.nearest_nodes(self.graph, X=origin_lon, Y=origin_lat)
             dest_node = ox.nearest_nodes(self.graph, X=dest_lon, Y=dest_lat)
@@ -180,19 +172,24 @@ class FRENDSRoutingEngine:
         base_total_time = 0.0
 
         try:
+            # Attempt routing within the bounding box
             base_total_time, path = nx.bidirectional_dijkstra(
                 safe_graph, source=orig_node, target=dest_node, weight=get_edge_weight
             )
-        except nx.NetworkXNoPath:
-            # NO FALLBACK ALLOWED! If it fails here, it is genuinely flooded.
-            return {"status": "error", "message": f"No safe route available for {vehicle_layer} clearance. Destination is isolated by flooding."}
         except Exception as e:
-            return {"status": "error", "message": f"Route calculation exception: {e}"}
+            print(f"⚠️ Local subgraph failed ({e}). Complex one-ways likely cut off. Falling back to full graph...")
+            try:
+                # FALLBACK: If the bbox cut off the only U-turn (common near Taft), use the full graph
+                base_total_time, path = nx.bidirectional_dijkstra(
+                    self.graph, source=orig_node, target=dest_node, weight=get_edge_weight
+                )
+            except Exception as ex:
+                return {"status": "error", "message": f"No safe route available. Destination isolated. ({ex})"}
 
-        if not path: 
-            return {"status": "error", "message": "Failed to generate path array."}
+        if not path or len(path) < 2: 
+            return {"status": "error", "message": "Failed to generate a valid drivable path array."}
 
-        # 5. COMPILE ROUTE PAYLOAD
+        # 6. COMPILE ROUTE PAYLOAD
         try:
             route_coords, route_segments = [], []
             total_distance, live_total_time = 0.0, 0.0

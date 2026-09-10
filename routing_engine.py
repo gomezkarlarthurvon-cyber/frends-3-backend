@@ -69,7 +69,7 @@ class FRENDSRoutingEngine:
         return (math.degrees(initial_bearing) + 360) % 360
 
     def get_turn_penalty(self, u, v, w, nodes):
-        """Calculates massive time penalties for illegal geometric turns."""
+        """Calculates massive time penalties for illegal geometric turns at intersections."""
         lat1, lon1 = nodes[u]
         lat2, lon2 = nodes[v]
         lat3, lon3 = nodes[w]
@@ -81,8 +81,10 @@ class FRENDSRoutingEngine:
         if angle_diff > 180: angle_diff -= 360
 
         abs_angle = abs(angle_diff)
-        if abs_angle > 160: return 1800.0  # U-TURN BUSTER (30 mins penalty)
-        if -135 < angle_diff < -45: return 25.0  # LEFT TURN (25 secs penalty)
+        
+        # Relaxed thresholds to avoid penalizing natural road curves
+        if abs_angle > 170: return 1800.0  # STRICT U-TURN (30 mins penalty)
+        if -130 < angle_diff < -65: return 20.0  # STRICT LEFT TURN (20 secs penalty)
         return 0.0
 
     # ============================================================
@@ -256,9 +258,8 @@ class FRENDSRoutingEngine:
 
                 if u == w or u in contracted or w in contracted: continue
 
-                # Bake in the Turn Penalty directly into the shortcut
-                turn_penalty = self.get_turn_penalty(u, node, w, nodes)
-                shortcut_time = in_edge["time"] + out_edge["time"] + turn_penalty
+                # FIXED: Do NOT apply turn penalties to degree-2 nodes (they are just curves!)
+                shortcut_time = in_edge["time"] + out_edge["time"]
 
                 shortcut = {
                     "u": u, "v": w,

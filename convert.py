@@ -1,32 +1,36 @@
-import pickle
-import networkx as nx
+import sqlite3, pickle, json
 
-def prune_graph_for_render(input_file="metro_manila.pkl", output_file="metro_manila_lite.pkl"):
-    print(f"Loading heavy graph from {input_file}... (This may take a moment)")
-    with open(input_file, "rb") as f:
-        G = pickle.load(f)
+print("⏳ Loading PKL into memory...")
+with open("metro_manila_lite.pkl", "rb") as f:
+    G = pickle.load(f)
 
-    print(f"Original graph loaded: {len(G.nodes)} nodes, {len(G.edges)} edges.")
-    print("Pruning useless metadata to save RAM...")
+print("🗄️ Creating SQLite Database...")
+conn = sqlite3.connect("metro_manila.db")
+c = conn.cursor()
 
-    # 1. Prune Nodes (Keep ONLY x and y)
-    for n, data in G.nodes(data=True):
-        keys_to_delete = [k for k in data.keys() if k not in ['x', 'y']]
-        for k in keys_to_delete:
-            del data[k]
+c.execute('''CREATE TABLE IF NOT EXISTS nodes (id INTEGER PRIMARY KEY, lat REAL, lon REAL)''')
+c.execute('''CREATE TABLE IF NOT EXISTS edges (u INTEGER, v INTEGER, length REAL, time REAL, geometry TEXT)''')
 
-    # 2. Prune Edges (Keep ONLY length, travel_time, and geometry)
-    for u, v, k, data in G.edges(keys=True, data=True):
-        keys_to_delete = [k for k in data.keys() if k not in ['length', 'travel_time', 'geometry']]
-        for k in keys_to_delete:
-            del data[k]
+print("📥 Inserting nodes...")
+c.executemany("INSERT OR IGNORE INTO nodes VALUES (?, ?, ?)", 
+              [(n, d['y'], d['x']) for n, d in G.nodes(data=True)])
 
-    print("Saving highly compressed lite graph...")
-    # Using HIGHEST_PROTOCOL compresses it even further
-    with open(output_file, "wb") as f:
-        pickle.dump(G, f, protocol=pickle.HIGHEST_PROTOCOL)
+print("🛣️ Inserting edges...")
+edges_to_insert = []
+for u, v, k, d in G.edges(keys=True, data=True):
+    geom = d.get('geometry', [])
+    # Failsafe if Shapely coords snuck through
+    if hasattr(geom, 'coords'): geom = list(geom.coords)
+    time = float(d.get('travel_time', d.get('baseline_time', 0)))
+    edges_to_insert.append((u, v, float(d.get('length', 0)), time, json.dumps(geom)))
 
-    print(f"✅ Success! Upload '{output_file}' to Render.")
+c.executemany("INSERT INTO edges VALUES (?, ?, ?, ?, ?)", edges_to_insert)
 
-if __name__ == "__main__":
-    prune_graph_for_render()
+print("⚡ Building spatial indexes (this makes queries instant)...")
+c.execute("CREATE INDEX IF NOT EXISTS idx_lat_lon ON nodes(lat, lon)")
+c.execute("CREATE INDEX IF NOT EXISTS idx_edges_u ON edges(u)")
+c.execute("CREATE INDEX IF NOT EXISTS idx_edges_v ON edges(v)")
+
+conn.commit()
+conn.close()
+print("✅ Done! You now have 'metro_manila.db'. Upload this to Render instead of the .pkl!")

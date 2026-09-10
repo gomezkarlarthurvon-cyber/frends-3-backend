@@ -7,7 +7,6 @@ from math import radians, cos, sin, asin, sqrt
 
 class FRENDSRoutingEngine:
     def __init__(self, db_file="metro_manila.db"):
-        """Initializes the engine. No RAM used on startup!"""
         self.db_file = db_file
         print(f"⏳ FRENDS JIT Routing Engine Initialized linked to {self.db_file}.")
 
@@ -43,7 +42,6 @@ class FRENDSRoutingEngine:
         return self.haversine_distance(py, px, y1 + t * dy, x1 + t * dx)
 
     def nearest_node_sql(self, lat, lon, cursor):
-        """Ultra-fast nearest node using SQLite Euclidean approximation."""
         cursor.execute('''
             SELECT id FROM nodes 
             ORDER BY ((lat - ?) * (lat - ?) + (lon - ?) * (lon - ?)) ASC LIMIT 1
@@ -60,8 +58,7 @@ class FRENDSRoutingEngine:
         except (ValueError, TypeError):
             return {"status": "error", "message": "Invalid coordinates provided."}
 
-        # 1. SQL BOUNDING BOX QUERY (Grabs only the streets we need)
-        buffer = 0.08 # Approx 8-10km padding
+        buffer = 0.08 
         min_lat, max_lat = min(origin_lat, dest_lat) - buffer, max(origin_lat, dest_lat) + buffer
         min_lon, max_lon = min(origin_lon, dest_lon) - buffer, max(origin_lon, dest_lon) + buffer
 
@@ -76,7 +73,6 @@ class FRENDSRoutingEngine:
                 conn.close()
                 return {"status": "error", "message": "Origin or Destination is completely off the map grid."}
 
-            # Massive memory saver: Query edges strictly within the bbox
             c.execute('''
                 SELECT u, v, length, time, geometry 
                 FROM edges 
@@ -86,7 +82,6 @@ class FRENDSRoutingEngine:
             
             edges = c.fetchall()
             
-            # Fetch node coordinates for geometry mapping
             c.execute('SELECT id, lat, lon FROM nodes WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?', 
                       (min_lat, max_lat, min_lon, max_lon))
             nodes_data = {row[0]: (row[1], row[2]) for row in c.fetchall()}
@@ -98,14 +93,12 @@ class FRENDSRoutingEngine:
         if not edges:
             return {"status": "error", "message": "Route exceeds bounding box limits or no roads found."}
 
-        # 2. BUILD MICRO-GRAPH IN RAM (Takes < 10MB)
         local_graph = nx.DiGraph()
         for edge in edges:
             u, v, length, time, geom_str = edge
             geom = json.loads(geom_str) if geom_str else []
             local_graph.add_edge(u, v, length=length, travel_time=time, geometry=geom)
         
-        # 3. GEOMETRY-AWARE BLAST RADIUS FIREWALL
         flooded_edges_set = set()
         BLAST_RADIUS = 60  
         
@@ -152,13 +145,17 @@ class FRENDSRoutingEngine:
                         flooded_edges_set.add((u, v))
                         flooded_edges_set.add((v, u))
 
-        # 4. FILTER & ROUTE
         def filter_edge_strict(u, v):
             return (u, v) not in flooded_edges_set 
         safe_graph = nx.subgraph_view(local_graph, filter_edge=filter_edge_strict)
 
         def get_edge_weight(u, v, data):
-            return float(data.get('travel_time', data.get('length', 1.0)))
+            # PHYSICS FALLBACK: If time is 0, estimate based on length / ~30kmh
+            t = data.get('travel_time')
+            t = float(t) if t is not None else 0.0
+            if t <= 0:
+                t = float(data.get('length', 1.0)) / 8.33
+            return t
 
         try:
             base_total_time, path = nx.bidirectional_dijkstra(safe_graph, source=orig_node, target=dest_node, weight=get_edge_weight)
@@ -168,7 +165,6 @@ class FRENDSRoutingEngine:
         if not path or len(path) < 2: 
             return {"status": "error", "message": "Failed to generate a valid drivable path array."}
 
-        # 5. COMPILE PAYLOAD & APPLY TOMTOM MULTIPLIERS
         try:
             route_coords, route_segments = [], []
             total_distance, live_total_time = 0.0, 0.0
@@ -184,7 +180,12 @@ class FRENDSRoutingEngine:
                 
                 seg_length = float(edge_attrs.get('length', 0.0))
                 total_distance += seg_length
-                seg_time = float(edge_attrs.get('travel_time', seg_length / 8.33))
+                
+                # PHYSICS FALLBACK FOR PAYLOAD
+                raw_time = edge_attrs.get('travel_time')
+                seg_time = float(raw_time) if raw_time is not None else 0.0
+                if seg_time <= 0:
+                    seg_time = seg_length / 8.33
 
                 if api_key and (i % 8 == 0):
                     current_multiplier = self.get_tomtom_traffic_multiplier(node_u_data[0], node_u_data[1], api_key)

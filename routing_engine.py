@@ -165,8 +165,12 @@ class FRENDSRoutingEngine:
 
     def customize_for_floods(self, nodes, edges, flood_data, vehicle_layer):
         flooded_edges = set()
-        limits = {"LOW": 15, "MID": 30, "HIGH": 50}
-        max_safe_depth = limits.get(vehicle_layer, 15)
+        
+        # 🌟 UPDATED: Real-world Philippine wading depth limits (in cm)
+        limits = {"LOW": 20, "MID": 50, "HIGH": 90}
+        
+        # Safe string matching just in case the frontend sends lowercase
+        max_safe_depth = limits.get(str(vehicle_layer).upper(), 20)
         flood_points = []
 
         if not flood_data: return flooded_edges
@@ -187,7 +191,9 @@ class FRENDSRoutingEngine:
 
         if not flood_points: return flooded_edges
 
-        BLAST_RADIUS = 60.0
+        # 🌟 UPDATED: Reduced blast radius from 60m to 30m to prevent severing parallel safe roads
+        BLAST_RADIUS = 30.0
+        
         for edge in edges:
             if edge["shortcut"]: continue
             u, v = edge["u"], edge["v"]
@@ -239,7 +245,6 @@ class FRENDSRoutingEngine:
                 geom_out = out_edge.get("geometry") or [[nodes[out_edge["u"]][1], nodes[out_edge["u"]][0]], [nodes[out_edge["v"]][1], nodes[out_edge["v"]][0]]]
                 shortcut_geom = geom_in + geom_out[1:] 
 
-                # O(1) Pre-baking the physical entry/exit nodes
                 shortcut = {
                     "u": u, "v": w,
                     "length": in_edge["length"] + out_edge["length"],
@@ -300,7 +305,6 @@ class FRENDSRoutingEngine:
                 new_time = current_time + edge["time"]
                 
                 if prev_u is not None:
-                    # O(1) Lookups replace recursive unpacking
                     immediate_v = edge.get("first_v", edge["v"])
                     immediate_prev_u = prev_edge.get("last_u", prev_edge["u"]) if prev_edge else prev_u
                     new_time += self.get_turn_penalty(immediate_prev_u, u, immediate_v, nodes)

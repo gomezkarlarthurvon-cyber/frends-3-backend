@@ -9,7 +9,7 @@ from math import radians, cos, sin, asin, sqrt
 class FRENDSRoutingEngine:
     """
     FRENDS JIT-CCH Routing Engine (Optimized for Render 0.1 CPU / 512MB RAM)
-    Implements Degree-2 Chain Contraction with exact physical intersection vectors.
+    Implements Degree-2 Chain Contraction with O(1) pre-baked physical intersection vectors.
     """
 
     DEFAULT_SPEED_MPS = 8.33
@@ -17,10 +17,6 @@ class FRENDSRoutingEngine:
     def __init__(self, db_file="metro_manila.db"):
         self.db_file = db_file
         print(f"⏳ FRENDS JIT-CCH Engine initialized: {self.db_file}")
-
-    # ============================================================
-    # TRAFFIC & GEOMETRY
-    # ============================================================
 
     def get_tomtom_traffic_multiplier(self, lat, lon, api_key):
         url = "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json"
@@ -69,7 +65,6 @@ class FRENDSRoutingEngine:
         return (math.degrees(initial_bearing) + 360) % 360
 
     def get_turn_penalty(self, u, v, w, nodes):
-        """Calculates time penalties for illegal geometric turns at intersections."""
         lat1, lon1 = nodes[u]
         lat2, lon2 = nodes[v]
         lat3, lon3 = nodes[w]
@@ -81,13 +76,9 @@ class FRENDSRoutingEngine:
         if angle_diff > 180: angle_diff -= 360
 
         abs_angle = abs(angle_diff)
-        if abs_angle > 135: return 1800.0  # STRICT U-TURN / V-TURN (30 mins penalty)
-        if -130 < angle_diff < -65: return 20.0  # STRICT LEFT TURN (20 secs penalty)
+        if abs_angle > 135: return 1800.0 
+        if -130 < angle_diff < -65: return 20.0 
         return 0.0
-
-    # ============================================================
-    # DATABASE & LOCAL GRAPH
-    # ============================================================
 
     def nearest_node_sql(self, lat, lon, cursor):
         delta = 0.05
@@ -172,10 +163,6 @@ class FRENDSRoutingEngine:
             backward[v].append(edge)
         return forward, backward
 
-    # ============================================================
-    # PHASE 1: JIT-CCH FLOOD CUSTOMIZATION
-    # ============================================================
-
     def customize_for_floods(self, nodes, edges, flood_data, vehicle_layer):
         flooded_edges = set()
         limits = {"LOW": 15, "MID": 30, "HIGH": 50}
@@ -227,10 +214,6 @@ class FRENDSRoutingEngine:
         print(f"🌊 CCH Customization: {len(flooded_edges)} base edges dynamically severed.")
         return flooded_edges
 
-    # ============================================================
-    # PHASE 2: JIT-CCH FAST CONTRACTION (Degree-2 Pruning)
-    # ============================================================
-
     def apply_cch_contraction(self, nodes, edges, source, target):
         forward, backward = self.build_adjacency(nodes, edges)
         new_edges = list(edges)
@@ -256,6 +239,7 @@ class FRENDSRoutingEngine:
                 geom_out = out_edge.get("geometry") or [[nodes[out_edge["u"]][1], nodes[out_edge["u"]][0]], [nodes[out_edge["v"]][1], nodes[out_edge["v"]][0]]]
                 shortcut_geom = geom_in + geom_out[1:] 
 
+                # O(1) Pre-baking the physical entry/exit nodes
                 shortcut = {
                     "u": u, "v": w,
                     "length": in_edge["length"] + out_edge["length"],
@@ -263,7 +247,9 @@ class FRENDSRoutingEngine:
                     "geometry": shortcut_geom, 
                     "blocked": False, 
                     "shortcut": True,
-                    "children": (in_edge, out_edge)
+                    "children": (in_edge, out_edge),
+                    "first_v": in_edge.get("first_v", in_edge["v"]),
+                    "last_u": out_edge.get("last_u", out_edge["u"])
                 }
 
                 new_edges.append(shortcut)
@@ -279,23 +265,6 @@ class FRENDSRoutingEngine:
         print(f"⚡ JIT-CCH Contraction complete: {shortcut_count} degree-2 nodes zipped in O(V) time.")
         return new_edges
 
-    # ============================================================
-    # PHASE 3: JIT-CCH QUERY WITH VECTOR HEURISTICS
-    # ============================================================
-
-    # 🌟 NEW: Helper functions to dig inside shortcuts and grab physical intersection angles
-    def get_first_physical_node(self, edge):
-        curr = edge
-        while curr.get("shortcut"):
-            curr = curr["children"][0]
-        return curr["v"]
-
-    def get_last_physical_node(self, edge):
-        curr = edge
-        while curr.get("shortcut"):
-            curr = curr["children"][1]
-        return curr["u"]
-
     def cch_query(self, nodes, edges, source, target):
         graph = {}
         for edge in edges:
@@ -308,7 +277,6 @@ class FRENDSRoutingEngine:
             u_lat, u_lon = nodes[u]
             return (self.haversine_distance(u_lat, u_lon, target_lat, target_lon) / 22.2) 
 
-        # Queue tracking format: (f_score, current_time, current_node, prev_node, prev_edge)
         queue = [(heuristic(source), 0.0, source, None, None)]
         visited = {source: (0.0, None, None)}
 
@@ -331,10 +299,10 @@ class FRENDSRoutingEngine:
                 v = edge["v"]
                 new_time = current_time + edge["time"]
                 
-                # 🌟 THE FIX: Unpacks nested shortcuts instantly to calculate the exact physical turn penalty
                 if prev_u is not None:
-                    immediate_v = self.get_first_physical_node(edge)
-                    immediate_prev_u = self.get_last_physical_node(prev_edge) if prev_edge else prev_u
+                    # O(1) Lookups replace recursive unpacking
+                    immediate_v = edge.get("first_v", edge["v"])
+                    immediate_prev_u = prev_edge.get("last_u", prev_edge["u"]) if prev_edge else prev_u
                     new_time += self.get_turn_penalty(immediate_prev_u, u, immediate_v, nodes)
 
                 if new_time < visited.get(v, (float('inf'), None, None))[0]:
@@ -343,10 +311,6 @@ class FRENDSRoutingEngine:
                     heapq.heappush(queue, (f, new_time, v, u, edge))
 
         raise Exception("Target unreachable")
-
-    # ============================================================
-    # CPU-SAFE UNPACKING (Iterative)
-    # ============================================================
 
     def unpack_edge(self, edge):
         unpacked = []
@@ -360,10 +324,6 @@ class FRENDSRoutingEngine:
             else:
                 unpacked.append(curr)
         return unpacked
-
-    # ============================================================
-    # ROUTE OUTPUT & MAIN HANDLER
-    # ============================================================
 
     def build_route_payload(self, nodes, route_edges, api_key):
         route_coords, route_segments = [], []

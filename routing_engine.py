@@ -102,7 +102,12 @@ class FRENDSRoutingEngine:
 
     def load_local_graph(self, origin_lat, origin_lon, dest_lat, dest_lon):
         trip_distance_meters = self.haversine_distance(origin_lat, origin_lon, dest_lat, dest_lon)
-        dynamic_buffer = max(0.04, min(0.12, (trip_distance_meters / 111000.0) * 1.5))
+        
+        # 🌟 THE DIJKSTRA INSPIRATION (Dynamic Reroute Safety Buffer)
+        # Inspired by the hardcoded 0.08 buffer from your old Dijkstra code.
+        # We enforce a massive 0.06 degree (~6.6km) minimum buffer so the engine 
+        # always has enough physical road data loaded to calculate wide detours around sudden floods!
+        dynamic_buffer = max(0.06, min(0.15, (trip_distance_meters / 111000.0) * 2.0))
 
         min_lat = min(origin_lat, dest_lat) - dynamic_buffer
         max_lat = max(origin_lat, dest_lat) + dynamic_buffer
@@ -244,6 +249,7 @@ class FRENDSRoutingEngine:
                 geom_out = out_edge.get("geometry") or [[nodes[out_edge["u"]][1], nodes[out_edge["u"]][0]], [nodes[out_edge["v"]][1], nodes[out_edge["v"]][0]]]
                 shortcut_geom = geom_in + geom_out[1:] 
 
+                # O(1) Pre-baking the physical entry/exit nodes
                 shortcut = {
                     "u": u, "v": w,
                     "length": in_edge["length"] + out_edge["length"],

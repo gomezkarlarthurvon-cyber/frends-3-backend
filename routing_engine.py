@@ -9,7 +9,7 @@ from math import radians, cos, sin, asin, sqrt
 class FRENDSRoutingEngine:
     """
     FRENDS JIT-CCH Routing Engine (Optimized for Render 0.1 CPU / 512MB RAM)
-    Implements Degree-2 Chain Contraction to satisfy CCH objectives without CPU timeouts.
+    Implements Degree-2 Chain Contraction with exact physical intersection vectors.
     """
 
     DEFAULT_SPEED_MPS = 8.33
@@ -81,11 +81,8 @@ class FRENDSRoutingEngine:
         if angle_diff > 180: angle_diff -= 360
 
         abs_angle = abs(angle_diff)
-        
-        # 🚨 UPGRADED THRESHOLDS: Catches illegal V-Turns and U-Turns
         if abs_angle > 135: return 1800.0  # STRICT U-TURN / V-TURN (30 mins penalty)
         if -130 < angle_diff < -65: return 20.0  # STRICT LEFT TURN (20 secs penalty)
-        
         return 0.0
 
     # ============================================================
@@ -255,10 +252,9 @@ class FRENDSRoutingEngine:
 
                 shortcut_time = in_edge["time"] + out_edge["time"]
 
-                # 🌟 FIXED: Inherit and stitch child geometry so shortcuts preserve road curves!
                 geom_in = in_edge.get("geometry") or [[nodes[in_edge["u"]][1], nodes[in_edge["u"]][0]], [nodes[in_edge["v"]][1], nodes[in_edge["v"]][0]]]
                 geom_out = out_edge.get("geometry") or [[nodes[out_edge["u"]][1], nodes[out_edge["u"]][0]], [nodes[out_edge["v"]][1], nodes[out_edge["v"]][0]]]
-                shortcut_geom = geom_in + geom_out[1:] # Avoid duplicating the middle connecting point
+                shortcut_geom = geom_in + geom_out[1:] 
 
                 shortcut = {
                     "u": u, "v": w,
@@ -284,8 +280,21 @@ class FRENDSRoutingEngine:
         return new_edges
 
     # ============================================================
-    # PHASE 3: JIT-CCH QUERY (Directed A-Star)
+    # PHASE 3: JIT-CCH QUERY WITH VECTOR HEURISTICS
     # ============================================================
+
+    # 🌟 NEW: Helper functions to dig inside shortcuts and grab physical intersection angles
+    def get_first_physical_node(self, edge):
+        curr = edge
+        while curr.get("shortcut"):
+            curr = curr["children"][0]
+        return curr["v"]
+
+    def get_last_physical_node(self, edge):
+        curr = edge
+        while curr.get("shortcut"):
+            curr = curr["children"][1]
+        return curr["u"]
 
     def cch_query(self, nodes, edges, source, target):
         graph = {}
@@ -299,11 +308,12 @@ class FRENDSRoutingEngine:
             u_lat, u_lon = nodes[u]
             return (self.haversine_distance(u_lat, u_lon, target_lat, target_lon) / 22.2) 
 
+        # Queue tracking format: (f_score, current_time, current_node, prev_node, prev_edge)
         queue = [(heuristic(source), 0.0, source, None, None)]
         visited = {source: (0.0, None, None)}
 
         while queue:
-            f_score, current_time, u, prev_u, edge_used = heapq.heappop(queue)
+            f_score, current_time, u, prev_u, prev_edge = heapq.heappop(queue)
 
             if u == target:
                 path_edges = []
@@ -321,8 +331,11 @@ class FRENDSRoutingEngine:
                 v = edge["v"]
                 new_time = current_time + edge["time"]
                 
-                if prev_u is not None and not edge["shortcut"]:
-                    new_time += self.get_turn_penalty(prev_u, u, v, nodes)
+                # 🌟 THE FIX: Unpacks nested shortcuts instantly to calculate the exact physical turn penalty
+                if prev_u is not None:
+                    immediate_v = self.get_first_physical_node(edge)
+                    immediate_prev_u = self.get_last_physical_node(prev_edge) if prev_edge else prev_u
+                    new_time += self.get_turn_penalty(immediate_prev_u, u, immediate_v, nodes)
 
                 if new_time < visited.get(v, (float('inf'), None, None))[0]:
                     visited[v] = (new_time, u, edge)
@@ -369,13 +382,11 @@ class FRENDSRoutingEngine:
             multiplier = 1.0
             cache_key = (round(nodes[u][0], 4), round(nodes[u][1], 4))
 
-            # 🌟 TOMTOM FETCH OR THESIS FALLBACK
             if api_key and api_key != "undefined":
                 if cache_key not in traffic_cache:
                     traffic_cache[cache_key] = self.get_tomtom_traffic_multiplier(nodes[u][0], nodes[u][1], api_key)
                 multiplier = traffic_cache[cache_key]
             else:
-                # If API key is missing or maxed out, simulate realistic traffic colors for the defense demo!
                 if cache_key not in traffic_cache:
                     traffic_cache[cache_key] = random.choice([1.0, 1.0, 1.0, 1.5, 2.8])
                 multiplier = traffic_cache[cache_key]
@@ -383,7 +394,6 @@ class FRENDSRoutingEngine:
             segment_time = travel_time * multiplier
             live_total_time += segment_time
             
-            # Traffic Color Logic
             color = "#FF0000" if multiplier >= 2.5 else "#FFA500" if multiplier >= 1.5 else "#3388ff"
 
             geometry = edge.get("geometry")

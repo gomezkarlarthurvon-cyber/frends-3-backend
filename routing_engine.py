@@ -69,7 +69,7 @@ class FRENDSRoutingEngine:
         return (math.degrees(initial_bearing) + 360) % 360
 
     def get_turn_penalty(self, u, v, w, nodes):
-        """Calculates massive time penalties for illegal geometric turns at intersections."""
+        """Calculates time penalties for illegal geometric turns at intersections."""
         lat1, lon1 = nodes[u]
         lat2, lon2 = nodes[v]
         lat3, lon3 = nodes[w]
@@ -81,8 +81,6 @@ class FRENDSRoutingEngine:
         if angle_diff > 180: angle_diff -= 360
 
         abs_angle = abs(angle_diff)
-        
-        # Relaxed thresholds to avoid penalizing natural road curves
         if abs_angle > 170: return 1800.0  # STRICT U-TURN (30 mins penalty)
         if -130 < angle_diff < -65: return 20.0  # STRICT LEFT TURN (20 secs penalty)
         return 0.0
@@ -112,7 +110,6 @@ class FRENDSRoutingEngine:
         return result[0] if result else None
 
     def load_local_graph(self, origin_lat, origin_lon, dest_lat, dest_lon):
-        # DYNAMIC BOUNDING BOX: Scales buffer based on trip distance to save RAM
         trip_distance_meters = self.haversine_distance(origin_lat, origin_lon, dest_lat, dest_lon)
         dynamic_buffer = max(0.04, min(0.12, (trip_distance_meters / 111000.0) * 1.5))
 
@@ -235,10 +232,6 @@ class FRENDSRoutingEngine:
     # ============================================================
 
     def apply_cch_contraction(self, nodes, edges, source, target):
-        """
-        CPU-Optimized Contraction: Only targets degree-2 nodes.
-        Zips long, winding roads into single massive shortcuts in milliseconds.
-        """
         forward, backward = self.build_adjacency(nodes, edges)
         new_edges = list(edges)
         contracted = set()
@@ -250,7 +243,6 @@ class FRENDSRoutingEngine:
             in_edges = [e for e in backward.get(node, []) if not e["blocked"]]
             out_edges = [e for e in forward.get(node, []) if not e["blocked"]]
 
-            # Fast Contraction Rule: Only contract if exactly 1 in and 1 out
             if len(in_edges) == 1 and len(out_edges) == 1:
                 in_edge = in_edges[0]
                 out_edge = out_edges[0]
@@ -258,14 +250,18 @@ class FRENDSRoutingEngine:
 
                 if u == w or u in contracted or w in contracted: continue
 
-                # FIXED: Do NOT apply turn penalties to degree-2 nodes (they are just curves!)
                 shortcut_time = in_edge["time"] + out_edge["time"]
+
+                # 🌟 FIXED: Inherit and stitch child geometry so shortcuts preserve road curves!
+                geom_in = in_edge.get("geometry") or [[nodes[in_edge["u"]][1], nodes[in_edge["u"]][0]], [nodes[in_edge["v"]][1], nodes[in_edge["v"]][0]]]
+                geom_out = out_edge.get("geometry") or [[nodes[out_edge["u"]][1], nodes[out_edge["u"]][0]], [nodes[out_edge["v"]][1], nodes[out_edge["v"]][0]]]
+                shortcut_geom = geom_in + geom_out[1:] # Avoid duplicating the middle connecting point
 
                 shortcut = {
                     "u": u, "v": w,
                     "length": in_edge["length"] + out_edge["length"],
                     "time": shortcut_time,
-                    "geometry": None, 
+                    "geometry": shortcut_geom, 
                     "blocked": False, 
                     "shortcut": True,
                     "children": (in_edge, out_edge)
@@ -275,7 +271,6 @@ class FRENDSRoutingEngine:
                 forward.setdefault(u, []).append(shortcut)
                 backward.setdefault(w, []).append(shortcut)
                 
-                # Mark original edges as effectively bypassed for the query
                 in_edge["blocked"] = True
                 out_edge["blocked"] = True
                 
@@ -290,7 +285,6 @@ class FRENDSRoutingEngine:
     # ============================================================
 
     def cch_query(self, nodes, edges, source, target):
-        """Runs an A-Star directed query over the newly contracted graph."""
         graph = {}
         for edge in edges:
             if edge.get("blocked"): continue
@@ -302,7 +296,6 @@ class FRENDSRoutingEngine:
             u_lat, u_lon = nodes[u]
             return (self.haversine_distance(u_lat, u_lon, target_lat, target_lon) / 22.2) 
 
-        # (f_score, current_time, current_node, previous_node, edge_used)
         queue = [(heuristic(source), 0.0, source, None, None)]
         visited = {source: (0.0, None, None)}
 
@@ -325,7 +318,6 @@ class FRENDSRoutingEngine:
                 v = edge["v"]
                 new_time = current_time + edge["time"]
                 
-                # Apply dynamic turn penalties if NOT using a shortcut
                 if prev_u is not None and not edge["shortcut"]:
                     new_time += self.get_turn_penalty(prev_u, u, v, nodes)
 
@@ -341,19 +333,16 @@ class FRENDSRoutingEngine:
     # ============================================================
 
     def unpack_edge(self, edge):
-        """Unpacks CCH shortcuts iteratively to prevent Python recursion crashes."""
         unpacked = []
         stack = [edge]
         
         while stack:
             curr = stack.pop()
             if curr.get("shortcut") and curr.get("children"):
-                # Append in reverse order so the left child is processed first
                 stack.append(curr["children"][1])
                 stack.append(curr["children"][0])
             else:
                 unpacked.append(curr)
-                
         return unpacked
 
     # ============================================================
@@ -376,7 +365,6 @@ class FRENDSRoutingEngine:
 
             multiplier = 1.0
             if api_key:
-                # FIXED TYPO HERE: Changed nodes[u][4] back to nodes[u][0]
                 cache_key = (round(nodes[u][0], 4), round(nodes[u][1], 4))
                 if cache_key not in traffic_cache:
                     traffic_cache[cache_key] = self.get_tomtom_traffic_multiplier(nodes[u][0], nodes[u][1], api_key)
@@ -391,6 +379,7 @@ class FRENDSRoutingEngine:
             if geometry:
                 coords = [{"latitude": lat, "longitude": lon} for lon, lat in geometry]
             else:
+                # 🌟 Safety fallback if geometry is completely missing
                 coords = [{"latitude": nodes[u][0], "longitude": nodes[u][1]}, {"latitude": nodes[v][0], "longitude": nodes[v][1]}]
 
             route_segments.append({"coords": coords, "color": color})
@@ -428,19 +417,15 @@ class FRENDSRoutingEngine:
         if not nodes or not edges: return {"status": "error", "message": "Route exceeds limits or no roads found."}
         source, target = endpoints
 
-        # PHASE 1: CUSTOMIZATION
         try: self.customize_for_floods(nodes, edges, flood_data, vehicle_layer)
         except Exception as e: return {"status": "error", "message": f"Flood customization failed: {e}"}
 
-        # PHASE 2: CONTRACTION
         try: cch_edges = self.apply_cch_contraction(nodes, edges, source, target)
         except Exception as e: return {"status": "error", "message": f"CCH preprocessing failed: {e}"}
 
-        # PHASE 3: QUERY
         try: base_time, route_edges = self.cch_query(nodes, cch_edges, source, target)
         except Exception: return {"status": "error", "message": "No safe route available. Destination isolated by floods."}
 
-        # CPU-SAFE UNPACKING
         unpacked = []
         for edge in route_edges: unpacked.extend(self.unpack_edge(edge))
 

@@ -166,11 +166,10 @@ class FRENDSRoutingEngine:
     def customize_for_floods(self, nodes, edges, flood_data, vehicle_layer):
         flooded_edges = set()
         
-        # 🌟 UPDATED: Real-world Philippine wading depth limits (in cm)
-        limits = {"LOW": 20, "MID": 50, "HIGH": 90}
+        # 🌟 REAL-WORLD PHILIPPINE LIMITS (in cm)
+        limits = {"LOW": 25, "MID": 70, "HIGH": 100}
         
-        # Safe string matching just in case the frontend sends lowercase
-        max_safe_depth = limits.get(str(vehicle_layer).upper(), 20)
+        max_safe_depth = limits.get(str(vehicle_layer).upper(), 25)
         flood_points = []
 
         if not flood_data: return flooded_edges
@@ -184,14 +183,14 @@ class FRENDSRoutingEngine:
             try:
                 water_level = float(latest.get("waterLevel", latest.get("depth", 0)))
                 lat, lon = float(latest.get("lat", 0)), float(latest.get("lng", latest.get("lon", 0)))
-                if water_level >= max_safe_depth and lat and lon:
+                # 🌟 FIXED: strictly greater than operator
+                if water_level > max_safe_depth and lat and lon:
                     flood_points.append((lat, lon))
             except (TypeError, ValueError):
                 continue
 
         if not flood_points: return flooded_edges
 
-        # 🌟 UPDATED: Reduced blast radius from 60m to 30m to prevent severing parallel safe roads
         BLAST_RADIUS = 30.0
         
         for edge in edges:

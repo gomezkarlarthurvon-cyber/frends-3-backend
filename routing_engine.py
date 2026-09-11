@@ -9,7 +9,7 @@ from math import radians, cos, sin, asin, sqrt
 class FRENDSRoutingEngine:
     """
     FRENDS JIT-CCH Routing Engine (Optimized for Render 0.1 CPU / 512MB RAM)
-    Implements Degree-2 Chain Contraction with O(1) pre-baked physical intersection vectors.
+    Implements Degree-2 Chain Contraction with O(1) pre-baked vectors and Google-style traffic slicing.
     """
 
     DEFAULT_SPEED_MPS = 8.33
@@ -17,6 +17,10 @@ class FRENDSRoutingEngine:
     def __init__(self, db_file="metro_manila.db"):
         self.db_file = db_file
         print(f"⏳ FRENDS JIT-CCH Engine initialized: {self.db_file}")
+
+    # ============================================================
+    # TRAFFIC & GEOMETRY
+    # ============================================================
 
     def get_tomtom_traffic_multiplier(self, lat, lon, api_key):
         url = "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json"
@@ -30,7 +34,7 @@ class FRENDSRoutingEngine:
                 if current_speed and free_flow_speed and current_speed > 0:
                     return min(free_flow_speed / current_speed, 5.0)
             if response.status_code in (403, 429):
-                return random.choice([1.0, 1.0, 1.8, 3.0])
+                return random.choice([1.0, 1.0, 1.35, 2.2])
         except Exception:
             pass
         return 1.0
@@ -80,6 +84,10 @@ class FRENDSRoutingEngine:
         if -130 < angle_diff < -65: return 20.0 
         return 0.0
 
+    # ============================================================
+    # DATABASE & LOCAL GRAPH
+    # ============================================================
+
     def nearest_node_sql(self, lat, lon, cursor):
         delta = 0.05
         cursor.execute(
@@ -102,11 +110,6 @@ class FRENDSRoutingEngine:
 
     def load_local_graph(self, origin_lat, origin_lon, dest_lat, dest_lon):
         trip_distance_meters = self.haversine_distance(origin_lat, origin_lon, dest_lat, dest_lon)
-        
-        # 🌟 THE DIJKSTRA INSPIRATION (Dynamic Reroute Safety Buffer)
-        # Inspired by the hardcoded 0.08 buffer from your old Dijkstra code.
-        # We enforce a massive 0.06 degree (~6.6km) minimum buffer so the engine 
-        # always has enough physical road data loaded to calculate wide detours around sudden floods!
         dynamic_buffer = max(0.06, min(0.15, (trip_distance_meters / 111000.0) * 2.0))
 
         min_lat = min(origin_lat, dest_lat) - dynamic_buffer
@@ -168,12 +171,13 @@ class FRENDSRoutingEngine:
             backward[v].append(edge)
         return forward, backward
 
+    # ============================================================
+    # PHASE 1: JIT-CCH DYNAMIC FLOOD CUSTOMIZATION
+    # ============================================================
+
     def customize_for_floods(self, nodes, edges, flood_data, vehicle_layer):
         flooded_edges = set()
-        
-        # 🌟 REAL-WORLD PHILIPPINE LIMITS (in cm)
         limits = {"LOW": 25, "MID": 70, "HIGH": 100}
-        
         max_safe_depth = limits.get(str(vehicle_layer).upper(), 25)
         flood_points = []
 
@@ -188,7 +192,7 @@ class FRENDSRoutingEngine:
             try:
                 water_level = float(latest.get("waterLevel", latest.get("depth", 0)))
                 lat, lon = float(latest.get("lat", 0)), float(latest.get("lng", latest.get("lon", 0)))
-                # 🌟 FIXED: strictly greater than operator
+                
                 if water_level > max_safe_depth and lat and lon:
                     flood_points.append((lat, lon))
             except (TypeError, ValueError):
@@ -221,8 +225,15 @@ class FRENDSRoutingEngine:
                 edge["blocked"] = True
                 flooded_edges.add((u, v))
 
-        print(f"🌊 CCH Customization: {len(flooded_edges)} base edges dynamically severed.")
+        print(f"🛡️ VEHICLE PROFILE: {str(vehicle_layer).upper()} (Max Safe Depth: {max_safe_depth}cm)")
+        if len(flood_points) > 0:
+            print(f"🌊 HAZARD AVOIDANCE: {len(flood_points)} impassable floods detected. {len(flooded_edges)} road segments dynamically severed.")
+
         return flooded_edges
+
+    # ============================================================
+    # PHASE 2: JIT-CCH FAST CONTRACTION
+    # ============================================================
 
     def apply_cch_contraction(self, nodes, edges, source, target):
         forward, backward = self.build_adjacency(nodes, edges)
@@ -249,7 +260,6 @@ class FRENDSRoutingEngine:
                 geom_out = out_edge.get("geometry") or [[nodes[out_edge["u"]][1], nodes[out_edge["u"]][0]], [nodes[out_edge["v"]][1], nodes[out_edge["v"]][0]]]
                 shortcut_geom = geom_in + geom_out[1:] 
 
-                # O(1) Pre-baking the physical entry/exit nodes
                 shortcut = {
                     "u": u, "v": w,
                     "length": in_edge["length"] + out_edge["length"],
@@ -274,6 +284,10 @@ class FRENDSRoutingEngine:
 
         print(f"⚡ JIT-CCH Contraction complete: {shortcut_count} degree-2 nodes zipped in O(V) time.")
         return new_edges
+
+    # ============================================================
+    # PHASE 3: JIT-CCH QUERY WITH VECTOR HEURISTICS
+    # ============================================================
 
     def cch_query(self, nodes, edges, source, target):
         graph = {}
@@ -324,7 +338,6 @@ class FRENDSRoutingEngine:
     def unpack_edge(self, edge):
         unpacked = []
         stack = [edge]
-        
         while stack:
             curr = stack.pop()
             if curr.get("shortcut") and curr.get("children"):
@@ -334,36 +347,76 @@ class FRENDSRoutingEngine:
                 unpacked.append(curr)
         return unpacked
 
-    def build_route_payload(self, nodes, route_edges, api_key):
-        route_coords, route_segments = [], []
-        total_distance, live_total_time = 0.0, 0.0
-        traffic_cache = {}
+    # ============================================================
+    # OSRM TRAFFIC SLICER (FOR COMMUTES LIKE CAVITE -> MANILA)
+    # ============================================================
 
+    def build_osrm_segments(self, osrm_coords, api_key, is_city=False):
+        """
+        Slices long-distance routes into ~350m chunks and queries TomTom flow 
+        to paint Google Maps-style yellow and red patches without rate limiting.
+        """
+        if not osrm_coords or len(osrm_coords) < 2:
+            return [], 0.0
+
+        segments = []
+        traffic_cache = {}
+        chunk = []
+        accumulated_dist = 0.0
+        total_duration = 0.0
+        
+        # Base speeds: 30km/h for Metro Manila, 60km/h for Highways
+        base_speed = 8.33 if is_city else 16.6 
+
+        for i in range(len(osrm_coords) - 1):
+            lon1, lat1 = osrm_coords[i]
+            lon2, lat2 = osrm_coords[i+1]
+            dist = self.haversine_distance(lat1, lon1, lat2, lon2)
+            accumulated_dist += dist
+
+            chunk.append({"latitude": lat1, "longitude": lon1})
+
+            if accumulated_dist >= 350 or i == len(osrm_coords) - 2:
+                chunk.append({"latitude": lat2, "longitude": lon2})
+                mid_lat = (chunk[0]["latitude"] + chunk[-1]["latitude"]) / 2.0
+                mid_lon = (chunk[0]["longitude"] + chunk[-1]["longitude"]) / 2.0
+                cache_key = (round(mid_lat, 3), round(mid_lon, 3))
+
+                multiplier = 1.0
+                if api_key and api_key != "undefined":
+                    if cache_key not in traffic_cache:
+                        traffic_cache[cache_key] = self.get_tomtom_traffic_multiplier(mid_lat, mid_lon, api_key)
+                    multiplier = traffic_cache[cache_key]
+
+                # 🌟 GOOGLE MAPS TRAFFIC SCHEME
+                if multiplier >= 2.2: color = "#EF4444"      # Red
+                elif multiplier >= 1.25: color = "#F59E0B"   # Yellow
+                else: color = "#00A3FF"                      # Blue
+
+                segments.append({"coords": list(chunk), "color": color})
+                
+                chunk_time = (accumulated_dist / base_speed) * multiplier
+                total_duration += chunk_time
+
+                chunk = [{"latitude": lat2, "longitude": lon2}]
+                accumulated_dist = 0.0
+
+        return segments, total_duration
+
+    # ============================================================
+    # ROUTE OUTPUT & MAIN HANDLER
+    # ============================================================
+
+    def build_route_payload(self, nodes, route_edges, api_key):
+        route_coords = []
+        total_distance = 0.0
+
+        # 1. Flatten all edges into a single continuous coordinate path
         for edge in route_edges:
             u, v = edge["u"], edge["v"]
             if u not in nodes or v not in nodes: continue
-
-            length = float(edge.get("length", 0))
-            travel_time = float(edge.get("time", 0))
-            if travel_time <= 0: travel_time = length / self.DEFAULT_SPEED_MPS
-            total_distance += length
-
-            multiplier = 1.0
-            cache_key = (round(nodes[u][0], 4), round(nodes[u][1], 4))
-
-            if api_key and api_key != "undefined":
-                if cache_key not in traffic_cache:
-                    traffic_cache[cache_key] = self.get_tomtom_traffic_multiplier(nodes[u][0], nodes[u][1], api_key)
-                multiplier = traffic_cache[cache_key]
-            else:
-                if cache_key not in traffic_cache:
-                    traffic_cache[cache_key] = random.choice([1.0, 1.0, 1.0, 1.5, 2.8])
-                multiplier = traffic_cache[cache_key]
-
-            segment_time = travel_time * multiplier
-            live_total_time += segment_time
             
-            color = "#FF0000" if multiplier >= 2.5 else "#FFA500" if multiplier >= 1.5 else "#3388ff"
+            total_distance += float(edge.get("length", 0))
 
             geometry = edge.get("geometry")
             if geometry:
@@ -371,15 +424,19 @@ class FRENDSRoutingEngine:
             else:
                 coords = [{"latitude": nodes[u][0], "longitude": nodes[u][1]}, {"latitude": nodes[v][0], "longitude": nodes[v][1]}]
 
-            route_segments.append({"coords": coords, "color": color})
             route_coords.extend(coords)
 
+        # 2. Clean duplicate connecting nodes
         cleaned_coords, previous = [], None
         for point in route_coords:
             current = (point["latitude"], point["longitude"])
             if current == previous: continue
             cleaned_coords.append(point)
             previous = current
+
+        # 3. 🌟 THE FIX: Process coordinates through the 350m chunker to prevent API blocking!
+        osrm_format_coords = [[p["longitude"], p["latitude"]] for p in cleaned_coords]
+        route_segments, live_total_time = self.build_osrm_segments(osrm_format_coords, api_key, is_city=True)
 
         return {
             "status": "success",
@@ -390,8 +447,6 @@ class FRENDSRoutingEngine:
         }
 
     def compute_route(self, origin_lat, origin_lon, dest_lat, dest_lon, vehicle_layer="LOW", api_key=None, flood_data=None):
-        print(f"\n🗺️ FRENDS JIT-CCH route request: ({origin_lat}, {origin_lon}) → ({dest_lat}, {dest_lon})")
-
         try:
             origin_lat, origin_lon = float(origin_lat), float(origin_lon)
             dest_lat, dest_lon = float(dest_lat), float(dest_lon)

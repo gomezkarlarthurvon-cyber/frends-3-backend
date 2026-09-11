@@ -140,12 +140,16 @@ def get_dynamic_route():
                         duration = osrm_data["routes"][0]["duration"]
                         route = [{"latitude": c[1], "longitude": c[0]} for c in osrm_coords]
 
+                        # 🌟 SLICE OSRM ROUTE TO PAINT YELLOW TRAFFIC PATCHES
+                        segments, live_duration = engine.build_osrm_segments(osrm_coords, TOMTOM_API_KEY, is_city=False)
+                        final_time = live_duration if live_duration > 0 else duration
+
                         return jsonify({
                             "status": "SUCCESS",
                             "path": route,
-                            "segments": [],
+                            "segments": segments,
                             "distance": distance,
-                            "time": duration,
+                            "time": final_time,
                         }), 200
 
                 route = [

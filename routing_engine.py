@@ -81,8 +81,11 @@ class FRENDSRoutingEngine:
         if angle_diff > 180: angle_diff -= 360
 
         abs_angle = abs(angle_diff)
-        if abs_angle > 170: return 1800.0  # STRICT U-TURN (30 mins penalty)
+        
+        # 🚨 UPGRADED THRESHOLDS: Catches illegal V-Turns and U-Turns
+        if abs_angle > 135: return 1800.0  # STRICT U-TURN / V-TURN (30 mins penalty)
         if -130 < angle_diff < -65: return 20.0  # STRICT LEFT TURN (20 secs penalty)
+        
         return 0.0
 
     # ============================================================

@@ -400,6 +400,41 @@ class FRENDSRoutingEngine:
             "distance": float(total_distance),
             "time": float(live_total_time)
         }
+        
+    def fetch_osrm_fallback(self, origin_lat, origin_lon, dest_lat, dest_lon, api_key):
+        print(f"⚠️ Out of Bounds: Delegating {origin_lat},{origin_lon} -> {dest_lat},{dest_lon} to OSRM Fallback...")
+        # Standard OSRM public API endpoint for driving routes
+        url = f"http://router.project-osrm.org/route/v1/driving/{origin_lon},{origin_lat};{dest_lon},{dest_lat}?overview=full&geometries=geojson"
+        
+        try:
+            response = requests.get(url, timeout=5.0)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("code") == "Ok":
+                    route = data["routes"][0]
+                    total_distance = route["distance"]
+                    
+                    # OSRM returns GeoJSON format: [longitude, latitude]
+                    coordinates = route["geometry"]["coordinates"]
+                    
+                    # Reformat for the frontend MapSection.jsx
+                    cleaned_coords = [{"latitude": p[1], "longitude": p[0]} for p in coordinates]
+                    
+                    # Pass the OSRM coordinates through the existing chunker 
+                    # to seamlessly apply TomTom traffic coloring to the fallback route
+                    route_segments, live_total_time = self.build_osrm_segments(coordinates, api_key, is_city=False)
+                    
+                    return {
+                        "status": "success",
+                        "path": cleaned_coords,
+                        "segments": route_segments,
+                        "distance": float(total_distance),
+                        "time": float(live_total_time)
+                    }
+        except Exception as e:
+            print(f"🚨 OSRM Fallback encountered an error: {e}")
+            
+        return {"status": "error", "message": "Location is outside coverage area and fallback routing failed."}
 
     def compute_route(self, origin_lat, origin_lon, dest_lat, dest_lon, vehicle_layer="LOW", api_key=None, flood_data=None):
         try:
@@ -423,7 +458,8 @@ class FRENDSRoutingEngine:
 
             if not nodes or not edges: 
                 if attempt == len(buffer_stages) - 1:
-                    return {"status": "error", "message": "Route exceeds limits or no roads found."}
+                    # 🔥 GRACEFUL DEGRADATION: Trigger OSRM instead of crashing
+                    return self.fetch_osrm_fallback(origin_lat, origin_lon, dest_lat, dest_lon, api_key)
                 continue
                 
             source, target = endpoints

@@ -134,10 +134,19 @@ class FRENDSRoutingEngine:
                 try: geometry_data = json.loads(geometry) if geometry else None
                 except Exception: geometry_data = None
 
+                edge_length = float(length or 0)
+                edge_time = float(time_value or 0)
+
+                # 🏎️ EXPRESSWAY MAGNET: 
+                # If base speed >= 15 m/s (approx 54 km/h), it is a major highway.
+                # Artificially discount the time by 40% so the A* engine prioritizes it.
+                if edge_time > 0 and (edge_length / edge_time) >= 15.0:
+                    edge_time *= 0.60 
+
                 edges.append({
                     "u": u, "v": v, 
-                    "length": float(length or 0), 
-                    "time": float(time_value or 0),
+                    "length": edge_length, 
+                    "time": edge_time,
                     "geometry": geometry_data, 
                     "blocked": False, 
                     "shortcut": False, 
@@ -446,7 +455,7 @@ class FRENDSRoutingEngine:
         # 🌟 THE MASTER FIX: DYNAMIC EXPANSION STRATEGY
         # Starts with a blazing-fast 1.5km grid. If floods block the detour, it automatically expands 
         # up to an 8km radius to find side-streets, preventing both "No Path" errors AND "Timeouts"!
-        buffer_stages = [0.015, 0.035, 0.07] 
+        buffer_stages = [0.04, 0.08, 0.15] # Roughly 4.5km, 9km, and 16km padding
         route_edges = []
         base_time = 0
         

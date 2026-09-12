@@ -7,17 +7,12 @@ import requests
 from math import radians, cos, sin, asin, sqrt
 
 class FRENDSRoutingEngine:
-    """
-    FRENDS JIT-CCH Routing Engine
-    Implements Dynamic Expansion Detouring: Automatically expands the map grid 
-    if floods block the immediate path, guaranteeing an alternative route without server timeouts.
-    """
 
     DEFAULT_SPEED_MPS = 8.33
 
     def __init__(self, db_file="metro_manila.db"):
         self.db_file = db_file
-        print(f"⏳ FRENDS JIT-CCH Engine initialized: {self.db_file}")
+        print(f" FRENDS JIT-CCH Engine initialized: {self.db_file}")
 
     def get_tomtom_traffic_multiplier(self, lat, lon, api_key):
         url = "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json"
@@ -101,7 +96,7 @@ class FRENDSRoutingEngine:
         result = cursor.fetchone()
         return result[0] if result else None
 
-    # 🌟 FIX 1: Accepts dynamic buffer radius for the expansion strategy
+    # Accepts dynamic buffer radius for the expansion strategy
     def load_local_graph(self, origin_lat, origin_lon, dest_lat, dest_lon, buffer_radius):
         min_lat = min(origin_lat, dest_lat) - buffer_radius
         max_lat = max(origin_lat, dest_lat) + buffer_radius
@@ -164,7 +159,7 @@ class FRENDSRoutingEngine:
 
     def customize_for_floods(self, nodes, edges, flood_data, vehicle_layer):
         flooded_edges = set()
-        limits = {"LOW": 25, "MID": 70, "HIGH": 100}
+        limits = {"LOW": 15.24, "MID": 45.27, "HIGH": 60.96}
         max_safe_depth = limits.get(str(vehicle_layer).upper(), 25)
         flood_points = []
 
@@ -187,7 +182,7 @@ class FRENDSRoutingEngine:
 
         if not flood_points: return flooded_edges
 
-        # 🌟 FIX 2: Tighter 15-meter blast radius. Safely blocks the flooded intersection 
+        # Tighter 15-meter blast radius. Safely blocks the flooded intersection 
         # WITHOUT bleeding over and destroying the safe parallel streets!
         BLAST_RADIUS = 15.0
         
@@ -325,7 +320,7 @@ class FRENDSRoutingEngine:
         if not osrm_coords or len(osrm_coords) < 2:
             return [], 0.0
 
-        # 🌟 FIX 3: Dynamic Traffic Chunker. Caps TomTom requests at 10 to completely eliminate Render server timeouts
+        # Dynamic Traffic Chunker. Caps TomTom requests at 10 to completely eliminate Render server timeouts
         total_dist = 0
         for i in range(len(osrm_coords)-1):
             total_dist += self.haversine_distance(osrm_coords[i][1], osrm_coords[i][0], osrm_coords[i+1][1], osrm_coords[i+1][0])

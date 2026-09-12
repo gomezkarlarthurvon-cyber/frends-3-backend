@@ -1,10 +1,10 @@
 import sqlite3, pickle, json
 
-print("⏳ Loading PKL into memory...")
+print(" Loading PKL into memory...")
 with open("metro_manila_lite.pkl", "rb") as f:
     G = pickle.load(f)
 
-print("🗄️ Creating SQLite Database...")
+print(" reating SQLite Database...")
 conn = sqlite3.connect("metro_manila.db")
 c = conn.cursor()
 
@@ -33,4 +33,4 @@ c.execute("CREATE INDEX IF NOT EXISTS idx_edges_v ON edges(v)")
 
 conn.commit()
 conn.close()
-print("✅ Done! You now have 'metro_manila.db'. Upload this to Render instead of the .pkl!")
+print("Done! metro_manila.pkl is now converted to metro_manila.db")

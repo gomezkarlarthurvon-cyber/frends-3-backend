@@ -223,6 +223,59 @@ class FRENDSRoutingEngine:
 
         return flooded_edges
 
+    def apply_hazard_penalties(self, nodes, edges, reports_data):
+        if not reports_data: return
+
+        # 🌟 Define time penalties in seconds based on hazard severity
+        hazard_penalties = {
+            "Accident": 600.0,      # +10 mins (Severe choke point)
+            "Construction": 300.0,  # +5 mins (Lane reduction)
+            "Hazard": 180.0,        # +3 mins (Slowing down)
+            "Police": 60.0          # +1 min (Minor rubbernecking delay)
+        }
+        
+        active_hazards = []
+        for _, report in reports_data.items():
+            if not isinstance(report, dict): continue
+            
+            lat = float(report.get("lat", 0))
+            lon = float(report.get("lng", report.get("lon", 0)))
+            hazard_type = report.get("type", "Hazard")
+            penalty = hazard_penalties.get(hazard_type, 180.0)
+            
+            if lat and lon:
+                active_hazards.append((lat, lon, penalty))
+
+        if not active_hazards: return
+
+        # 50-meter collision radius for hazards
+        HAZARD_BLAST_RADIUS = 50.0  
+        
+        affected_edges = 0
+        for edge in edges:
+            if edge.get("blocked") or edge.get("shortcut"): continue
+            
+            u, v = edge["u"], edge["v"]
+            geometry = edge.get("geometry")
+            if not geometry:
+                if u not in nodes or v not in nodes: continue
+                geometry = [(nodes[u][1], nodes[u][0]), (nodes[v][1], nodes[v][0])]
+
+            # Check spatial collision using Haversine
+            for hazard_lat, hazard_lon, penalty in active_hazards:
+                for i in range(len(geometry) - 1):
+                    lon1, lat1 = geometry[i]
+                    lon2, lat2 = geometry[i + 1]
+                    dist = self.point_to_line_distance(hazard_lon, hazard_lat, lon1, lat1, lon2, lat2)
+                    
+                    if dist <= HAZARD_BLAST_RADIUS:
+                        edge["time"] += penalty
+                        affected_edges += 1
+                        break # Apply penalty once per edge to prevent stacking the same accident
+
+        if affected_edges > 0:
+            print(f"⚠️ JIT-CCH PENALTIES APPLIED: {affected_edges} road segments delayed by user incident reports.")
+
     def apply_cch_contraction(self, nodes, edges, source, target):
         forward, backward = self.build_adjacency(nodes, edges)
         new_edges = list(edges)
@@ -445,17 +498,17 @@ class FRENDSRoutingEngine:
             
         return {"status": "error", "message": "Location is outside coverage area and fallback routing failed."}
 
-    def compute_route(self, origin_lat, origin_lon, dest_lat, dest_lon, vehicle_layer="LOW", api_key=None, flood_data=None):
+    def compute_route(self, origin_lat, origin_lon, dest_lat, dest_lon, vehicle_layer="LOW", api_key=None, flood_data=None, reports_data=None):
         try:
             origin_lat, origin_lon = float(origin_lat), float(origin_lon)
             dest_lat, dest_lon = float(dest_lat), float(dest_lon)
         except (ValueError, TypeError):
             return {"status": "error", "message": "Invalid coordinates provided."}
-
-        # 🌟 THE MASTER FIX: DYNAMIC EXPANSION STRATEGY
+        
+        #  THE MASTER FIX: DYNAMIC EXPANSION STRATEGY
         # Starts with a blazing-fast 1.5km grid. If floods block the detour, it automatically expands 
         # up to an 8km radius to find side-streets, preventing both "No Path" errors AND "Timeouts"!
-        buffer_stages = [0.04, 0.08, 0.15] # Roughly 4.5km, 9km, and 16km padding
+        buffer_stages = [0.04, 0.08, 0.15] 
         route_edges = []
         base_time = 0
         
@@ -467,23 +520,23 @@ class FRENDSRoutingEngine:
 
             if not nodes or not edges: 
                 if attempt == len(buffer_stages) - 1:
-                    # 🔥 GRACEFUL DEGRADATION: Trigger OSRM instead of crashing
                     return self.fetch_osrm_fallback(origin_lat, origin_lon, dest_lat, dest_lon, api_key)
                 continue
                 
             source, target = endpoints
 
             try: 
+                # 🌟 THE JIT-CCH CUSTOMIZATION PIPELINE
                 self.customize_for_floods(nodes, edges, flood_data, vehicle_layer)
+                self.apply_hazard_penalties(nodes, edges, reports_data) # Inject live traffic delays
+                
                 cch_edges = self.apply_cch_contraction(nodes, edges, source, target)
                 base_time, route_edges = self.cch_query(nodes, cch_edges, source, target)
                 
-                # If we succeed, break out of the expansion loop!
                 print(f"✅ Safe detour successfully mapped using radius stage {attempt+1} ({buf})")
                 break 
                 
             except Exception:
-                # Target unreachable (isolated by the current grid size)
                 if attempt == len(buffer_stages) - 1:
                     return {"status": "error", "message": "No safe route available. Destination isolated by floods."}
                 print(f"⚠️ Detour blocked by floods. Automatically expanding search grid to radius {buffer_stages[attempt+1]}...")

@@ -87,10 +87,13 @@ def get_dynamic_route():
             print("🛣️ Both points in Metro Manila: Using local JIT-CCH engine.")
 
             try:
+                # 🌟 Fetch both hardware flood nodes AND crowdsourced hazard reports
                 flood_data = db.reference("nodes").get() 
+                reports_data = db.reference("reports").get() 
             except Exception as e:
-                print(f"⚠️ Failed to fetch flood data for routing: {e}")
+                print(f"⚠️️ Failed to fetch Firebase data for routing: {e}")
                 flood_data = None
+                reports_data = None
 
             route_result = engine.compute_route(
                 origin_lat=origin_lat,
@@ -99,7 +102,8 @@ def get_dynamic_route():
                 dest_lon=dest_lon,
                 vehicle_layer=vehicle_layer,
                 api_key=TOMTOM_API_KEY,
-                flood_data=flood_data 
+                flood_data=flood_data,
+                reports_data=reports_data #  Pass the hazards directly into the math engine
             )
 
             if isinstance(route_result, dict) and route_result.get("status") == "error":

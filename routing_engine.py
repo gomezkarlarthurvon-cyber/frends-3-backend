@@ -60,6 +60,40 @@ class FRENDSRoutingEngine:
         initial_bearing = math.atan2(x, y)
         return (math.degrees(initial_bearing) + 360) % 360
 
+    # 🌟 NEW HELPER: Azimuthal Vector Filtering for Northbound/Southbound/Eastbound/Westbound Lanes
+    def is_same_lane_direction(self, edge_bearing, target_direction):
+        if target_direction is None or target_direction == "":
+            return True  # Fallback: affects both directions if no lane bound is specified
+
+        if isinstance(target_direction, str):
+            clean_dir = target_direction.strip().upper()
+            if clean_dir in ("ALL", "BOTH", "ALL LANES", "BOTH LANES"):
+                return True
+
+            cardinal_map = {
+                "NB": 0.0, "NORTHBOUND": 0.0, "NORTHBOUND (NB)": 0.0, "N": 0.0,
+                "EB": 90.0, "EASTBOUND": 90.0, "EASTBOUND (EB)": 90.0, "E": 90.0,
+                "SB": 180.0, "SOUTHBOUND": 180.0, "SOUTHBOUND (SB)": 180.0, "S": 180.0,
+                "WB": 270.0, "WESTBOUND": 270.0, "WESTBOUND (WB)": 270.0, "W": 270.0
+            }
+
+            if clean_dir in cardinal_map:
+                target_bearing = cardinal_map[clean_dir]
+            else:
+                try:
+                    target_bearing = float(clean_dir)
+                except ValueError:
+                    return True
+        else:
+            try:
+                target_bearing = float(target_direction)
+            except (ValueError, TypeError):
+                return True
+
+        # Smallest angular difference between the road edge and the reported lane (0 to 180 degrees)
+        angle_diff = abs((edge_bearing - target_bearing + 180) % 360 - 180)
+        return angle_diff <= 65.0  # True only if flowing in the same directional corridor
+
     def get_turn_penalty(self, u, v, w, nodes):
         lat1, lon1 = nodes[u]
         lat2, lon2 = nodes[v]
@@ -76,7 +110,39 @@ class FRENDSRoutingEngine:
         if -130 < angle_diff < -65: return 20.0 
         return 0.0
 
-    def nearest_node_sql(self, lat, lon, cursor):
+    # 🌟 UPGRADED: Heading-Aware GPS Snapping (Prevents snapping across the center island)
+    def nearest_node_sql(self, lat, lon, cursor, user_heading=None):
+        if user_heading is not None:
+            try:
+                heading_val = float(user_heading)
+                delta = 0.0005  # ~55m search box around the vehicle
+                cursor.execute(
+                    """
+                    SELECT e.u, n1.lat, n1.lon, n2.lat, n2.lon
+                    FROM edges e
+                    JOIN nodes n1 ON e.u = n1.id
+                    JOIN nodes n2 ON e.v = n2.id
+                    WHERE n1.lat BETWEEN ? AND ? AND n1.lon BETWEEN ? AND ?
+                    """,
+                    (lat - delta, lat + delta, lon - delta, lon + delta)
+                )
+                best_node = None
+                best_score = float("inf")
+
+                for u_id, u_lat, u_lon, v_lat, v_lon in cursor.fetchall():
+                    edge_bearing = self.calculate_heading(u_lat, u_lon, v_lat, v_lon)
+                    if self.is_same_lane_direction(edge_bearing, heading_val):
+                        dist = self.haversine_distance(lat, lon, u_lat, u_lon)
+                        if dist < best_score:
+                            best_score = dist
+                            best_node = u_id
+
+                if best_node is not None:
+                    return best_node
+            except Exception:
+                pass
+
+        # Standard fallback when stationary or planning a route manually
         delta = 0.05
         cursor.execute(
             """
@@ -96,8 +162,8 @@ class FRENDSRoutingEngine:
         result = cursor.fetchone()
         return result[0] if result else None
 
-    # Accepts dynamic buffer radius for the expansion strategy
-    def load_local_graph(self, origin_lat, origin_lon, dest_lat, dest_lon, buffer_radius):
+    # Accepts dynamic buffer radius for the expansion strategy + optional user_heading
+    def load_local_graph(self, origin_lat, origin_lon, dest_lat, dest_lon, buffer_radius, user_heading=None):
         min_lat = min(origin_lat, dest_lat) - buffer_radius
         max_lat = max(origin_lat, dest_lat) + buffer_radius
         min_lon = min(origin_lon, dest_lon) - buffer_radius
@@ -107,7 +173,7 @@ class FRENDSRoutingEngine:
         cursor = conn.cursor()
 
         try:
-            origin_node = self.nearest_node_sql(origin_lat, origin_lon, cursor)
+            origin_node = self.nearest_node_sql(origin_lat, origin_lon, cursor, user_heading=user_heading)
             destination_node = self.nearest_node_sql(dest_lat, dest_lon, cursor)
 
             if origin_node is None or destination_node is None:
@@ -166,10 +232,12 @@ class FRENDSRoutingEngine:
             backward[v].append(edge)
         return forward, backward
 
+    # 🌟 UPGRADED: MMDA Standards + Lane-Aware Flood Customization
     def customize_for_floods(self, nodes, edges, flood_data, vehicle_layer):
         flooded_edges = set()
-        limits = {"LOW": 15.24, "MID": 45.27, "HIGH": 60.96}
-        max_safe_depth = limits.get(str(vehicle_layer).upper(), 25)
+        # Official MMDA Flood Gauge Thresholds (13 in = 33.02cm, 19 in = 48.26cm, 26 in = 66.04cm)
+        limits = {"LOW": 33.02, "MID": 48.26, "HIGH": 66.04}
+        max_safe_depth = limits.get(str(vehicle_layer).upper(), 33.02)
         flood_points = []
 
         if not flood_data: return flooded_edges
@@ -183,9 +251,11 @@ class FRENDSRoutingEngine:
             try:
                 water_level = float(latest.get("waterLevel", latest.get("depth", 0)))
                 lat, lon = float(latest.get("lat", 0)), float(latest.get("lng", latest.get("lon", 0)))
+                # 🌟 Read optional lane direction ("NB", "SB", "EB", "WB", or heading degrees)
+                lane_dir = latest.get("direction", latest.get("bound", latest.get("heading", None)))
                 
                 if water_level > max_safe_depth and lat and lon:
-                    flood_points.append((lat, lon))
+                    flood_points.append((lat, lon, lane_dir))
             except (TypeError, ValueError):
                 continue
 
@@ -198,20 +268,27 @@ class FRENDSRoutingEngine:
         for edge in edges:
             if edge["shortcut"]: continue
             u, v = edge["u"], edge["v"]
+            if u not in nodes or v not in nodes: continue
+
+            # Calculate overall directional bearing of this directed road edge (u -> v)
+            edge_bearing = self.calculate_heading(nodes[u][0], nodes[u][1], nodes[v][0], nodes[v][1])
+
             geometry = edge.get("geometry")
             if not geometry:
-                if u not in nodes or v not in nodes: continue
                 geometry = [(nodes[u][1], nodes[u][0]), (nodes[v][1], nodes[v][0])]
 
             blocked = False
-            for flood_lat, flood_lon in flood_points:
+            for flood_lat, flood_lon, lane_dir in flood_points:
                 for i in range(len(geometry) - 1):
                     lon1, lat1 = geometry[i]
                     lon2, lat2 = geometry[i + 1]
                     dist = self.point_to_line_distance(flood_lon, flood_lat, lon1, lat1, lon2, lat2)
                     if dist <= BLAST_RADIUS:
-                        blocked = True
-                        break
+                        # Use exact sub-segment bearing if coordinates differ, otherwise overall edge bearing
+                        seg_bearing = self.calculate_heading(lat1, lon1, lat2, lon2) if (lat1 != lat2 or lon1 != lon2) else edge_bearing
+                        if self.is_same_lane_direction(seg_bearing, lane_dir):
+                            blocked = True
+                            break
                 if blocked: break
 
             if blocked:
@@ -219,14 +296,15 @@ class FRENDSRoutingEngine:
                 flooded_edges.add((u, v))
 
         if len(flood_points) > 0:
-            print(f"🌊 HAZARD DETECTED: {len(flood_points)} floods over {max_safe_depth}cm. {len(flooded_edges)} roads cut.")
+            print(f"🌊 HAZARD DETECTED: {len(flood_points)} floods over {max_safe_depth}cm. {len(flooded_edges)} lane-matched roads cut.")
 
         return flooded_edges
 
+    # 🌟 UPGRADED: Lane-Aware Crowdsourced Hazard Time Penalties
     def apply_hazard_penalties(self, nodes, edges, reports_data):
         if not reports_data: return
 
-        # 🌟 Define time penalties in seconds based on hazard severity
+        # Define time penalties in seconds based on hazard severity
         hazard_penalties = {
             "Accident": 600.0,      # +10 mins (Severe choke point)
             "Construction": 300.0,  # +5 mins (Lane reduction)
@@ -238,13 +316,18 @@ class FRENDSRoutingEngine:
         for _, report in reports_data.items():
             if not isinstance(report, dict): continue
             
-            lat = float(report.get("lat", 0))
-            lon = float(report.get("lng", report.get("lon", 0)))
-            hazard_type = report.get("type", "Hazard")
-            penalty = hazard_penalties.get(hazard_type, 180.0)
-            
-            if lat and lon:
-                active_hazards.append((lat, lon, penalty))
+            try:
+                lat = float(report.get("lat", 0))
+                lon = float(report.get("lng", report.get("lon", 0)))
+                hazard_type = report.get("type", "Hazard")
+                penalty = hazard_penalties.get(hazard_type, 180.0)
+                # 🌟 Extract reporter's heading or bound ("NB", "SB", etc.) so opposite lane isn't penalized
+                lane_dir = report.get("heading", report.get("direction", report.get("bound", None)))
+                
+                if lat and lon:
+                    active_hazards.append((lat, lon, penalty, lane_dir))
+            except (TypeError, ValueError):
+                continue
 
         if not active_hazards: return
 
@@ -256,25 +339,30 @@ class FRENDSRoutingEngine:
             if edge.get("blocked") or edge.get("shortcut"): continue
             
             u, v = edge["u"], edge["v"]
+            if u not in nodes or v not in nodes: continue
+
+            edge_bearing = self.calculate_heading(nodes[u][0], nodes[u][1], nodes[v][0], nodes[v][1])
+
             geometry = edge.get("geometry")
             if not geometry:
-                if u not in nodes or v not in nodes: continue
                 geometry = [(nodes[u][1], nodes[u][0]), (nodes[v][1], nodes[v][0])]
 
-            # Check spatial collision using Haversine
-            for hazard_lat, hazard_lon, penalty in active_hazards:
+            # Check spatial collision AND directional alignment
+            for hazard_lat, hazard_lon, penalty, lane_dir in active_hazards:
                 for i in range(len(geometry) - 1):
                     lon1, lat1 = geometry[i]
                     lon2, lat2 = geometry[i + 1]
                     dist = self.point_to_line_distance(hazard_lon, hazard_lat, lon1, lat1, lon2, lat2)
                     
                     if dist <= HAZARD_BLAST_RADIUS:
-                        edge["time"] += penalty
-                        affected_edges += 1
-                        break # Apply penalty once per edge to prevent stacking the same accident
+                        seg_bearing = self.calculate_heading(lat1, lon1, lat2, lon2) if (lat1 != lat2 or lon1 != lon2) else edge_bearing
+                        if self.is_same_lane_direction(seg_bearing, lane_dir):
+                            edge["time"] += penalty
+                            affected_edges += 1
+                            break  # Apply penalty once per edge to prevent stacking the same incident
 
         if affected_edges > 0:
-            print(f"⚠️ JIT-CCH PENALTIES APPLIED: {affected_edges} road segments delayed by user incident reports.")
+            print(f"⚠️ JIT-CCH PENALTIES APPLIED: {affected_edges} lane-matched road segments delayed by user incident reports.")
 
     def apply_cch_contraction(self, nodes, edges, source, target):
         forward, backward = self.build_adjacency(nodes, edges)
@@ -498,14 +586,14 @@ class FRENDSRoutingEngine:
             
         return {"status": "error", "message": "Location is outside coverage area and fallback routing failed."}
 
-    def compute_route(self, origin_lat, origin_lon, dest_lat, dest_lon, vehicle_layer="LOW", api_key=None, flood_data=None, reports_data=None):
+    def compute_route(self, origin_lat, origin_lon, dest_lat, dest_lon, vehicle_layer="LOW", api_key=None, flood_data=None, reports_data=None, user_heading=None):
         try:
             origin_lat, origin_lon = float(origin_lat), float(origin_lon)
             dest_lat, dest_lon = float(dest_lat), float(dest_lon)
         except (ValueError, TypeError):
             return {"status": "error", "message": "Invalid coordinates provided."}
         
-        #  THE MASTER FIX: DYNAMIC EXPANSION STRATEGY
+        # 🌟 THE MASTER FIX: DYNAMIC EXPANSION STRATEGY
         # Starts with a blazing-fast 1.5km grid. If floods block the detour, it automatically expands 
         # up to an 8km radius to find side-streets, preventing both "No Path" errors AND "Timeouts"!
         buffer_stages = [0.04, 0.08, 0.15] 
@@ -514,7 +602,9 @@ class FRENDSRoutingEngine:
         
         for attempt, buf in enumerate(buffer_stages):
             try:
-                nodes, edges, endpoints = self.load_local_graph(origin_lat, origin_lon, dest_lat, dest_lon, buf)
+                nodes, edges, endpoints = self.load_local_graph(
+                    origin_lat, origin_lon, dest_lat, dest_lon, buf, user_heading=user_heading
+                )
             except Exception as e:
                 return {"status": "error", "message": f"Database error: {e}"}
 

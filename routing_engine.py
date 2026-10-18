@@ -16,6 +16,8 @@ class FRENDSRoutingEngine:
     UTURN_PENALTY_S = 1800.0                     # in-place reversal (real crossovers cost far less, see turn penalty)
     LANE_SNAP_STEPS_DEG = (0.0005, 0.0015, 0.004)  # ~55 m, ~165 m, ~440 m search boxes for lane snapping
     ALONG_EDGE_SLACK_M = 25.0                    # GPS noise allowance before we treat the start node as "already passed"
+    MIN_HEADING_SPEED_MPS = 1.5                  # below this a GPS heading is noise, not a direction of travel
+    AUTO_LANE_SNAP_MAX_M = 80.0                  # auto lane choice only considers carriageways this close to the origin
 
     _BOUND_BEARINGS = {
         "N": 0.0, "NB": 0.0, "NORTH": 0.0, "NORTHBOUND": 0.0,
@@ -206,7 +208,7 @@ class FRENDSRoutingEngine:
         heading_out = self.calculate_heading(lat2, lon2, lat3, lon3)
         return self.heading_change_penalty(heading_in, heading_out)
 
-    def _snap_to_lane(self, lat, lon, cursor, target_bearing, prefer="ahead"):
+    def _snap_to_lane(self, lat, lon, cursor, target_bearing, prefer="ahead", max_dist=None):
         """Snap a GPS point onto the nearest road segment that flows in `target_bearing`.
 
         Works on the real (oriented) edge geometry and perpendicular distance, and widens the
@@ -215,7 +217,10 @@ class FRENDSRoutingEngine:
 
         prefer="ahead"   -> node the vehicle is driving toward (use for the trip origin)
         prefer="nearest" -> closest end of the matched edge   (use for the destination)"""
-        for delta in self.LANE_SNAP_STEPS_DEG:
+        steps = self.LANE_SNAP_STEPS_DEG
+        if max_dist is not None:   # one box just big enough for the cap is all we need
+            steps = (next((d for d in steps if d * 111000.0 >= max_dist), steps[-1]),)
+        for delta in steps:
             box = (lat - delta, lat + delta, lon - delta, lon + delta)
             cursor.execute(
                 """
@@ -247,7 +252,7 @@ class FRENDSRoutingEngine:
                         if angle_diff <= self.LANE_TOLERANCE_DEG:
                             dist, t = self.project_point_on_segment(lon, lat, lon1, lat1, lon2, lat2)
                             score = dist + 0.4 * angle_diff     # prefer close AND well-aligned
-                            if score < best_score:
+                            if (max_dist is None or dist <= max_dist) and score < best_score:
                                 best_score = score
                                 best = (u_id, v_id, travelled + t * seg_len, total)
                     travelled += seg_len
@@ -260,14 +265,30 @@ class FRENDSRoutingEngine:
                 return u_id if along <= self.ALONG_EDGE_SLACK_M else v_id
         return None
 
-    def origin_candidates(self, lat, lon, cursor, lane_bearing=None):
+    def origin_candidates(self, lat, lon, cursor, lane_bearing=None, dest=None):
         """Ordered start options as [(node_id, start_bearing), ...].
+
+        Lane known (user request / moving GPS heading):
           1. the lane the vehicle is in / the user asked for
           2. the opposite lane            (used when the requested lane is dead-ended, e.g. by a flood)
-          3. nearest node, lane-agnostic  (last resort)"""
+          3. nearest node, lane-agnostic  (last resort)
+        No lane known (pinned place, searched address, stationary GPS) -> "auto":
+          the nearest node plus the carriageways heading TOWARD and AWAY from the destination.
+          None carries a start bearing, so nothing forces a loop around the block, and
+          compute_route keeps whichever start gives the fastest trip."""
         if lane_bearing is None:
-            node = self.nearest_node_sql(lat, lon, cursor)
-            return [(node, None)] if node is not None else []
+            plain = self.nearest_node_sql(lat, lon, cursor)
+            candidates = [(plain, None)] if plain is not None else []
+            if dest is not None:
+                toward = self.calculate_heading(lat, lon, dest[0], dest[1])
+                for bearing in (toward, (toward + 180.0) % 360.0):
+                    try:
+                        node = self._snap_to_lane(lat, lon, cursor, bearing, max_dist=self.AUTO_LANE_SNAP_MAX_M)
+                    except (sqlite3.Error, TypeError, ValueError):
+                        node = None
+                    if node is not None and all(node != n for n, _ in candidates):
+                        candidates.append((node, None))
+            return candidates
 
         opposite = (lane_bearing + 180.0) % 360.0
         candidates = []
@@ -288,7 +309,7 @@ class FRENDSRoutingEngine:
         conn = sqlite3.connect(self.db_file)
         cursor = conn.cursor()
         try:
-            sources = self.origin_candidates(origin_lat, origin_lon, cursor, lane_bearing)
+            sources = self.origin_candidates(origin_lat, origin_lon, cursor, lane_bearing, dest=(dest_lat, dest_lon))
             target = self.nearest_node_sql(dest_lat, dest_lon, cursor, user_heading=dest_bearing, prefer="nearest")
             return sources, target
         finally:
@@ -767,27 +788,43 @@ class FRENDSRoutingEngine:
             
         return {"status": "error", "message": "Location is outside coverage area and fallback routing failed."}
 
-    def query_with_lane_fallback(self, nodes, cch_edges, sources, target):
-        """Try each start option in order (requested lane -> opposite lane -> lane-agnostic).
+    def query_with_lane_fallback(self, nodes, cch_edges, sources, target, pick_best=False, origin=None):
+        """pick_best=False: first start that reaches the target wins (requested lane, then opposite, then any).
+        pick_best=True : no trustworthy lane was given, so try every start and keep the fastest
+                         (including the time to reach that start node from the origin point).
         Returns (time, edges, index_of_source_used, start_bearing_used)."""
         last_error = Exception("Target unreachable")
+        best = None
         for idx, (src_node, bearing) in enumerate(sources):
             try:
                 base_time, route_edges = self.cch_query(nodes, cch_edges, src_node, target, start_bearing=bearing)
-                return base_time, route_edges, idx, bearing
             except Exception as exc:
                 last_error = exc
-        raise last_error
+                continue
+            if not pick_best:
+                return base_time, route_edges, idx, bearing
+            reach = 0.0
+            if origin is not None and src_node in nodes:
+                reach = self.haversine_distance(origin[0], origin[1], nodes[src_node][0], nodes[src_node][1]) / self.DEFAULT_SPEED_MPS
+            if best is None or base_time + reach < best[0]:
+                best = (base_time + reach, base_time, route_edges, idx, bearing)
+        if best is None:
+            raise last_error
+        return best[1], best[2], best[3], best[4]
 
     def compute_route(self, origin_lat, origin_lon, dest_lat, dest_lon, vehicle_layer="LOW", api_key=None,
                       flood_data=None, reports_data=None, user_heading=None,
-                      lane_direction=None, switch_lane=False, dest_direction=None):
+                      lane_direction=None, switch_lane=False, dest_direction=None, user_speed=None):
         """
         Lane controls (all optional):
           user_heading   GPS heading in degrees, or a bound ("NB", "southbound", ...).
           lane_direction explicit user request ("NB"/"SB"/"EB"/"WB"/degrees). Overrides GPS heading.
           switch_lane    True = flip to the opposite carriageway of whatever lane was resolved above.
           dest_direction lane the destination sits on, so the trip ends on the right carriageway.
+          user_speed     GPS speed in m/s. Under 1.5 the heading is treated as noise and ignored.
+        With no lane request and no trustworthy heading (a pinned/searched origin, or a stationary
+        phone) the engine tries the carriageways on both sides and keeps the fastest start, so the
+        trip never begins by driving away from the destination just to loop back.
         If the chosen lane is dead-ended (e.g. flooded ahead) the engine automatically switches to the
         opposite lane; the response reports it in "lane_switched" / "lane_bearing".
         """
@@ -797,7 +834,16 @@ class FRENDSRoutingEngine:
         except (ValueError, TypeError):
             return {"status": "error", "message": "Invalid coordinates provided."}
 
-        lane_bearing = self.resolve_lane_bearing(user_heading, lane_direction, switch_lane)
+        # A GPS heading is only a direction of travel while the vehicle is actually moving.
+        # (Browsers report a stale or arbitrary heading, often the last one, when stationary.)
+        stationary = False
+        try:
+            speed = float(user_speed)
+            stationary = math.isfinite(speed) and speed < self.MIN_HEADING_SPEED_MPS
+        except (TypeError, ValueError):
+            pass
+        gps_heading = user_heading if (not stationary or switch_lane) else None
+        lane_bearing = self.resolve_lane_bearing(gps_heading, lane_direction, switch_lane)
         dest_bearing = self.parse_lane_direction(dest_direction)
 
         try:
@@ -845,7 +891,8 @@ class FRENDSRoutingEngine:
                     nodes, edges, active[0][0], target, protected=[n for n, _ in active]
                 )
                 base_time, route_edges, used_idx, used_bearing = self.query_with_lane_fallback(
-                    nodes, cch_edges, active, target
+                    nodes, cch_edges, active, target,
+                    pick_best=(lane_bearing is None), origin=(origin_lat, origin_lon)
                 )
                 lane_switched = used_idx > 0 and lane_bearing is not None
 

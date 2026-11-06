@@ -479,6 +479,10 @@ class FRENDSRoutingEngine:
         limits = {"LOW": 33.02, "MID": 48.26, "HIGH": 66.04}
         max_safe_depth = limits.get(str(vehicle_layer).upper(), 33.02)
 
+        self.last_flood_zones = []
+        # Firebase returns a LIST (not a dict) when node keys are 0,1,2...
+        if isinstance(flood_data, list):
+            flood_data = {str(i): v for i, v in enumerate(flood_data) if v is not None}
         if not flood_data or not isinstance(flood_data, dict):
             return flooded_edges
 
@@ -538,6 +542,8 @@ class FRENDSRoutingEngine:
                 flooded_edges.add((edge["u"], edge["v"]))
 
         self.last_flood_info["edges_blocked"] = len(flooded_edges)
+        # Zones (lat, lon, lane, radius) so start/end points can be checked against them too
+        self.last_flood_zones = [(f[0], f[1], f[2], radii[i]) for i, f in enumerate(flood_points)]
         print(f"🌊 HAZARD DETECTED: {len(flood_points)} floods over {max_safe_depth}cm. {len(flooded_edges)} lane-matched roads cut.")
         return flooded_edges
 
@@ -842,6 +848,45 @@ class FRENDSRoutingEngine:
             
         return {"status": "error", "message": "Location is outside coverage area and fallback routing failed."}
 
+    # ------------------------------------------------------------------
+    # FLOOD-AWARE START / END POINTS
+    # ------------------------------------------------------------------
+    def _stub_hits_flood(self, p_lat, p_lon, n_lat, n_lon, zones):
+        """True if the short piece of road between a pin and the graph node it snaps to crosses a flood.
+        The graph only contains whole edges, so a flood on the partial stretch between the pin and its
+        junction used to be invisible: the flooded edge was removed, the route simply started (or ended)
+        on the far side of it, and the drawn line cut straight through the water."""
+        bearing = self.calculate_heading(p_lat, p_lon, n_lat, n_lon) if (p_lat != n_lat or p_lon != n_lon) else None
+        for z_lat, z_lon, lane, radius in zones:
+            if self.point_to_line_distance(z_lon, z_lat, p_lon, p_lat, n_lon, n_lat) <= radius:
+                if bearing is None or self.is_same_lane_direction(bearing, lane):
+                    return True
+        return False
+
+    def _clear_endpoint_candidates(self, lat, lon, nodes, base, zones, max_extra=8, radius_m=700.0):
+        """base: [(node_id, bearing)] chosen by lane snapping. Drop those whose stub crosses a flood and
+        append the nearest other junctions (any direction => the vehicle may turn around) whose stub is clear.
+        If everything is flooded (the pin itself is in the water) the original list is returned unchanged."""
+        if not zones:
+            return [(n, b) for n, b in base if n in nodes]
+        kept = [(n, b) for n, b in base
+                if n in nodes and not self._stub_hits_flood(lat, lon, nodes[n][0], nodes[n][1], zones)]
+        have = {n for n, _ in kept}
+        near = []
+        for n_id, (n_lat, n_lon) in nodes.items():
+            if n_id in have:
+                continue
+            d = self.haversine_distance(lat, lon, n_lat, n_lon)
+            if d <= radius_m:
+                near.append((d, n_id))
+        near.sort()
+        for _, n_id in near:
+            if len(kept) >= len(have) + max_extra:
+                break
+            if not self._stub_hits_flood(lat, lon, nodes[n_id][0], nodes[n_id][1], zones):
+                kept.append((n_id, None))
+        return kept or [(n, b) for n, b in base if n in nodes]
+
     def query_with_lane_fallback(self, nodes, cch_edges, sources, target, pick_best=False, origin=None, dest_bearing=None):
         """pick_best=False: first start that reaches the target wins (requested lane, then opposite, then any).
         pick_best=True : no trustworthy lane was given, so try every start and keep the fastest
@@ -938,19 +983,32 @@ class FRENDSRoutingEngine:
                 return {"status": "error", "message": f"Flood data processing failed: {e}"}
 
             try:
-                active = [(n, b) for n, b in sources if n in nodes]
-                if not active or target not in nodes:
+                zones = getattr(self, "last_flood_zones", [])
+                active = self._clear_endpoint_candidates(origin_lat, origin_lon, nodes, sources, zones)
+                targets = self._clear_endpoint_candidates(dest_lat, dest_lon, nodes, [(target, dest_bearing)], zones, max_extra=6)
+                if not active or not targets:
                     raise KeyError("Start or destination lies outside the local graph")
 
                 cch_edges = self.apply_cch_contraction(
-                    nodes, edges, active[0][0], target, protected=[n for n, _ in active]
+                    nodes, edges, active[0][0], targets[0][0],
+                    protected=[n for n, _ in active] + [n for n, _ in targets]
                 )
-                base_time, route_edges, used_idx, used_bearing = self.query_with_lane_fallback(
-                    nodes, cch_edges, active, target,
-                    pick_best=(lane_bearing is None), origin=(origin_lat, origin_lon),
-                    dest_bearing=dest_bearing
-                )
-                lane_switched = used_idx > 0 and lane_bearing is not None
+                last_exc = Exception("Target unreachable")
+                solved = None
+                for tgt, tgt_bearing in targets:
+                    try:
+                        solved = self.query_with_lane_fallback(
+                            nodes, cch_edges, active, tgt,
+                            pick_best=(lane_bearing is None or len(active) > 1 and active[0][1] is None),
+                            origin=(origin_lat, origin_lon), dest_bearing=tgt_bearing
+                        )
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                if solved is None:
+                    raise last_exc
+                base_time, route_edges, used_idx, used_bearing = solved
+                lane_switched = lane_bearing is not None and used_bearing is not None and used_bearing != lane_bearing
 
                 if lane_switched:
                     print(f"🔀 Lane switched: requested bound {lane_bearing:.0f}° was dead-ended, routing from the opposite lane.")

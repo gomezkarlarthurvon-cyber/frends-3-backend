@@ -27,7 +27,7 @@ if cred and (not firebase_admin._app_id_exists if hasattr(firebase_admin, '_app_
     except Exception as e:
         print(f"❌ CRITICAL: Failed to initialize Firebase: {e}")
 
-app = Flask(_name_)
+app = Flask(__name__)
 
 # Full CORS enabled for localhost and production frontends
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -219,6 +219,6 @@ def report_hazard():
         return jsonify({"status": "ERROR", "message": str(e)}), 500
 
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)

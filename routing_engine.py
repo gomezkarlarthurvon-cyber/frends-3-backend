@@ -212,57 +212,56 @@ class FRENDSRoutingEngine:
         """Snap a GPS point onto the nearest road segment that flows in `target_bearing`.
 
         Works on the real (oriented) edge geometry and perpendicular distance, and widens the
-        search box in steps. Highway edges can be hundreds of metres long, so a fixed ~55 m
-        box around *nodes* often found nothing and silently fell back to a lane-blind snap.
-
-        prefer="ahead"   -> node the vehicle is driving toward (use for the trip origin)
-        prefer="nearest" -> closest end of the matched edge   (use for the destination)"""
+        search box in steps. Uses a two-tier angular tolerance (65°, then 90° hemisphere fallback)
+        so diagonal avenues still snap cleanly to NB/SB carriageways."""
         steps = self.LANE_SNAP_STEPS_DEG
         if max_dist is not None:   # one box just big enough for the cap is all we need
             steps = (next((d for d in steps if d * 111000.0 >= max_dist), steps[-1]),)
-        for delta in steps:
-            box = (lat - delta, lat + delta, lon - delta, lon + delta)
-            cursor.execute(
-                """
-                SELECT e.u, e.v, n1.lat, n1.lon, n2.lat, n2.lon, e.geometry
-                FROM edges e
-                JOIN nodes n1 ON e.u = n1.id
-                JOIN nodes n2 ON e.v = n2.id
-                WHERE (n1.lat BETWEEN ? AND ? AND n1.lon BETWEEN ? AND ?)
-                   OR (n2.lat BETWEEN ? AND ? AND n2.lon BETWEEN ? AND ?)
-                """,
-                box + box
-            )
 
-            best, best_score = None, float("inf")
-            for u_id, v_id, u_lat, u_lon, v_lat, v_lon, geom in cursor.fetchall():
-                polyline = self._edge_polyline(geom, u_lat, u_lon, v_lat, v_lon)
-                seg_lengths = [
-                    self.haversine_distance(polyline[i][1], polyline[i][0], polyline[i + 1][1], polyline[i + 1][0])
-                    for i in range(len(polyline) - 1)
-                ]
-                total = sum(seg_lengths)
-                travelled = 0.0
-                for i, seg_len in enumerate(seg_lengths):
-                    lon1, lat1 = polyline[i][0], polyline[i][1]
-                    lon2, lat2 = polyline[i + 1][0], polyline[i + 1][1]
-                    if seg_len > 0:
-                        seg_bearing = self.calculate_heading(lat1, lon1, lat2, lon2)
-                        angle_diff = abs((seg_bearing - target_bearing + 180) % 360 - 180)
-                        if angle_diff <= self.LANE_TOLERANCE_DEG:
-                            dist, t = self.project_point_on_segment(lon, lat, lon1, lat1, lon2, lat2)
-                            score = dist + 0.4 * angle_diff     # prefer close AND well-aligned
-                            if (max_dist is None or dist <= max_dist) and score < best_score:
-                                best_score = score
-                                best = (u_id, v_id, travelled + t * seg_len, total)
-                    travelled += seg_len
+        for tol in (self.LANE_TOLERANCE_DEG, 90.0):
+            for delta in steps:
+                box = (lat - delta, lat + delta, lon - delta, lon + delta)
+                cursor.execute(
+                    """
+                    SELECT e.u, e.v, n1.lat, n1.lon, n2.lat, n2.lon, e.geometry
+                    FROM edges e
+                    JOIN nodes n1 ON e.u = n1.id
+                    JOIN nodes n2 ON e.v = n2.id
+                    WHERE (n1.lat BETWEEN ? AND ? AND n1.lon BETWEEN ? AND ?)
+                       OR (n2.lat BETWEEN ? AND ? AND n2.lon BETWEEN ? AND ?)
+                    """,
+                    box + box
+                )
 
-            if best is not None:
-                u_id, v_id, along, total = best
-                if prefer == "nearest":
-                    return u_id if along <= total / 2.0 else v_id
-                # "ahead": the vehicle can't drive back to u, so start from v unless it is basically still at u
-                return u_id if along <= self.ALONG_EDGE_SLACK_M else v_id
+                best, best_score = None, float("inf")
+                for u_id, v_id, u_lat, u_lon, v_lat, v_lon, geom in cursor.fetchall():
+                    polyline = self._edge_polyline(geom, u_lat, u_lon, v_lat, v_lon)
+                    seg_lengths = [
+                        self.haversine_distance(polyline[i][1], polyline[i][0], polyline[i + 1][1], polyline[i + 1][0])
+                        for i in range(len(polyline) - 1)
+                    ]
+                    total = sum(seg_lengths)
+                    travelled = 0.0
+                    for i, seg_len in enumerate(seg_lengths):
+                        lon1, lat1 = polyline[i][0], polyline[i][1]
+                        lon2, lat2 = polyline[i + 1][0], polyline[i + 1][1]
+                        if seg_len > 0:
+                            seg_bearing = self.calculate_heading(lat1, lon1, lat2, lon2)
+                            angle_diff = abs((seg_bearing - target_bearing + 180) % 360 - 180)
+                            if angle_diff <= tol:
+                                dist, t = self.project_point_on_segment(lon, lat, lon1, lat1, lon2, lat2)
+                                score = dist + 0.4 * angle_diff     # prefer close AND well-aligned
+                                if (max_dist is None or dist <= max_dist) and score < best_score:
+                                    best_score = score
+                                    best = (u_id, v_id, travelled + t * seg_len, total)
+                        travelled += seg_len
+
+                if best is not None:
+                    u_id, v_id, along, total = best
+                    if prefer == "nearest":
+                        return u_id if along <= total / 2.0 else v_id
+                    # "ahead": the vehicle can't drive back to u, so start from v unless it is basically still at u
+                    return u_id if along <= self.ALONG_EDGE_SLACK_M else v_id
         return None
 
     def origin_candidates(self, lat, lon, cursor, lane_bearing=None, dest=None):
@@ -604,7 +603,7 @@ class FRENDSRoutingEngine:
 
         return new_edges
 
-    def cch_query(self, nodes, edges, source, target, start_bearing=None):
+    def cch_query(self, nodes, edges, source, target, start_bearing=None, dest_bearing=None):
         graph = {}
         for edge in edges:
             if edge.get("blocked"): continue
@@ -648,6 +647,12 @@ class FRENDSRoutingEngine:
                     first_v = edge.get("first_v", edge["v"])
                     out_heading = self.calculate_heading(nodes[u][0], nodes[u][1], nodes[first_v][0], nodes[first_v][1])
                     new_time += self.heading_change_penalty(start_bearing, out_heading)
+
+                if v == target and dest_bearing is not None:
+                    # Final leg: penalize arriving at the destination against the target carriageway bound
+                    last_u = edge.get("last_u", u)
+                    in_heading = self.calculate_heading(nodes[last_u][0], nodes[last_u][1], nodes[v][0], nodes[v][1])
+                    new_time += self.heading_change_penalty(in_heading, dest_bearing)
 
                 if new_time < visited.get(v, (float('inf'), None, None))[0]:
                     visited[v] = (new_time, u, edge)
@@ -788,7 +793,7 @@ class FRENDSRoutingEngine:
             
         return {"status": "error", "message": "Location is outside coverage area and fallback routing failed."}
 
-    def query_with_lane_fallback(self, nodes, cch_edges, sources, target, pick_best=False, origin=None):
+    def query_with_lane_fallback(self, nodes, cch_edges, sources, target, pick_best=False, origin=None, dest_bearing=None):
         """pick_best=False: first start that reaches the target wins (requested lane, then opposite, then any).
         pick_best=True : no trustworthy lane was given, so try every start and keep the fastest
                          (including the time to reach that start node from the origin point).
@@ -797,7 +802,9 @@ class FRENDSRoutingEngine:
         best = None
         for idx, (src_node, bearing) in enumerate(sources):
             try:
-                base_time, route_edges = self.cch_query(nodes, cch_edges, src_node, target, start_bearing=bearing)
+                base_time, route_edges = self.cch_query(
+                    nodes, cch_edges, src_node, target, start_bearing=bearing, dest_bearing=dest_bearing
+                )
             except Exception as exc:
                 last_error = exc
                 continue
@@ -822,11 +829,6 @@ class FRENDSRoutingEngine:
           switch_lane    True = flip to the opposite carriageway of whatever lane was resolved above.
           dest_direction lane the destination sits on, so the trip ends on the right carriageway.
           user_speed     GPS speed in m/s. Under 1.5 the heading is treated as noise and ignored.
-        With no lane request and no trustworthy heading (a pinned/searched origin, or a stationary
-        phone) the engine tries the carriageways on both sides and keeps the fastest start, so the
-        trip never begins by driving away from the destination just to loop back.
-        If the chosen lane is dead-ended (e.g. flooded ahead) the engine automatically switches to the
-        opposite lane; the response reports it in "lane_switched" / "lane_bearing".
         """
         try:
             origin_lat, origin_lon = float(origin_lat), float(origin_lon)
@@ -835,7 +837,6 @@ class FRENDSRoutingEngine:
             return {"status": "error", "message": "Invalid coordinates provided."}
 
         # A GPS heading is only a direction of travel while the vehicle is actually moving.
-        # (Browsers report a stale or arbitrary heading, often the last one, when stationary.)
         stationary = False
         try:
             speed = float(user_speed)
@@ -857,8 +858,6 @@ class FRENDSRoutingEngine:
             return self.fetch_osrm_fallback(origin_lat, origin_lon, dest_lat, dest_lon, api_key)
 
         # 🌟 THE MASTER FIX: DYNAMIC EXPANSION STRATEGY
-        # Starts with a blazing-fast 1.5km grid. If floods block the detour, it automatically expands
-        # up to an 8km radius to find side-streets, preventing both "No Path" errors AND "Timeouts"!
         buffer_stages = [0.04, 0.08, 0.15]
         route_edges = []
         base_time = 0
@@ -881,7 +880,7 @@ class FRENDSRoutingEngine:
             try:
                 # 🌟 THE JIT-CCH CUSTOMIZATION PIPELINE
                 self.customize_for_floods(nodes, edges, flood_data, vehicle_layer)
-                self.apply_hazard_penalties(nodes, edges, reports_data) # Inject live traffic delays
+                self.apply_hazard_penalties(nodes, edges, reports_data)
 
                 active = [(n, b) for n, b in sources if n in nodes]
                 if not active or target not in nodes:
@@ -892,7 +891,8 @@ class FRENDSRoutingEngine:
                 )
                 base_time, route_edges, used_idx, used_bearing = self.query_with_lane_fallback(
                     nodes, cch_edges, active, target,
-                    pick_best=(lane_bearing is None), origin=(origin_lat, origin_lon)
+                    pick_best=(lane_bearing is None), origin=(origin_lat, origin_lon),
+                    dest_bearing=dest_bearing
                 )
                 lane_switched = used_idx > 0 and lane_bearing is not None
 

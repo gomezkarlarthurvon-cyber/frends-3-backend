@@ -29,8 +29,6 @@ app = Flask(__name__)
 # 🌟 FULL CORS ENABLED TO FIX LOCALHOST:5173 NETWORK/CORS BLOCK
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Initialize the routing engine
-engine = FRENDSRoutingEngine()
 
 TOMTOM_API_KEY = os.environ.get("TOMTOM_API_KEY")
 

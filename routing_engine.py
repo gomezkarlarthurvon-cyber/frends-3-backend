@@ -501,11 +501,11 @@ class FRENDSRoutingEngine:
         if not flood_points:
             return flooded_edges
 
-        # Adaptive blast radius. A sensor sits beside the road, not on its centreline, so a fixed
-        # 15 m radius missed floods pinned 15-30 m off the carriageway and the route ran straight
-        # through them. Each flood blocks every lane-matched edge within MAX(MIN_R, nearest road + SLACK),
-        # capped at MAX_R so safe parallel streets are still left alone.
-        MIN_R, MAX_R, SLACK = 25.0, 50.0, 6.0
+        # Blast radius: the original tight 15 m, so a flood blocks its own intersection WITHOUT bleeding
+        # over and cutting the safe parallel streets. Only a flood pinned off the road (nearest lane-matched
+        # road farther than 15 m, which the old fixed radius missed entirely) reaches out to the road,
+        # up to MAX_R, so it still blocks something.
+        BLAST_RADIUS, MAX_R, SLACK = 15.0, 30.0, 4.0
         nearest = [float("inf")] * len(flood_points)
         hits = []  # (edge, flood_index, distance)
 
@@ -535,7 +535,7 @@ class FRENDSRoutingEngine:
                     if best < nearest[fi]:
                         nearest[fi] = best
 
-        radii = [min(MAX_R, max(MIN_R, d + SLACK)) for d in nearest]
+        radii = [BLAST_RADIUS if d <= BLAST_RADIUS else min(MAX_R, d + SLACK) for d in nearest]
         for edge, fi, dist in hits:
             if dist <= radii[fi]:
                 edge["blocked"] = True

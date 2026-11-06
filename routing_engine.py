@@ -4,7 +4,6 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 import os
 from dotenv import load_dotenv
-from routing_engine import FRENDSRoutingEngine
 import requests  
 import threading
 import time

@@ -82,23 +82,16 @@ def get_dynamic_route():
         dest_lon = float(data["dest_lon"])
         vehicle_layer = data.get("vehicle_type", "LOW")
 
-        # 🌟 Extract NB / SB / EB / WB lane and telemetry parameters from the frontend
-        lane_direction = data.get("lane_direction")
-        dest_direction = data.get("dest_direction")
-        user_heading = data.get("user_heading")
-        switch_lane = bool(data.get("switch_lane", False))
-        user_speed = data.get("user_speed")
-
         # 1. HYBRID ROUTING CHECK (Metro Manila vs OSRM)
         if is_within_metro_manila(origin_lat, origin_lon) and is_within_metro_manila(dest_lat, dest_lon):
-            print(f"🛣️ Metro Manila Route | Vehicle: {vehicle_layer} | Lane: {lane_direction}")
+            print("🛣️ Both points in Metro Manila: Using local JIT-CCH engine.")
 
             try:
                 # 🌟 Fetch both hardware flood nodes AND crowdsourced hazard reports
                 flood_data = db.reference("nodes").get() 
                 reports_data = db.reference("reports").get() 
             except Exception as e:
-                print(f"⚠ Failed to fetch Firebase data for routing: {e}")
+                print(f"⚠️️ Failed to fetch Firebase data for routing: {e}")
                 flood_data = None
                 reports_data = None
 
@@ -110,12 +103,7 @@ def get_dynamic_route():
                 vehicle_layer=vehicle_layer,
                 api_key=TOMTOM_API_KEY,
                 flood_data=flood_data,
-                reports_data=reports_data,
-                user_heading=user_heading,
-                lane_direction=lane_direction,
-                switch_lane=switch_lane,
-                dest_direction=dest_direction,
-                user_speed=user_speed
+                reports_data=reports_data #  Pass the hazards directly into the math engine
             )
 
             if isinstance(route_result, dict) and route_result.get("status") == "error":
@@ -131,8 +119,6 @@ def get_dynamic_route():
                     "segments": route_result.get("segments", []),
                     "distance": route_result.get("distance", 0),
                     "time": route_result.get("time", 0),
-                    "lane_bearing": route_result.get("lane_bearing"),
-                    "lane_switched": route_result.get("lane_switched", False)
                 }), 200
             else:
                 return jsonify({

@@ -5,29 +5,31 @@ from flask_cors import CORS
 import os
 from dotenv import load_dotenv
 from routing_engine import FRENDSRoutingEngine
-import requests  
+import requests
 import threading
 import time
 
-load_dotenv() 
+load_dotenv()
 
 if os.path.exists('/etc/secrets/frends-v3-map-backend.json'):
     cred = credentials.Certificate('/etc/secrets/frends-v3-map-backend.json')
-else:
+elif os.path.exists('frends-v3-map-backend.json'):
     cred = credentials.Certificate('frends-v3-map-backend.json')
+else:
+    cred = None
 
-if not firebase_admin._app_id_exists if hasattr(firebase_admin, '_app_id_exists') else not firebase_admin._apps:
+if cred and (not firebase_admin._app_id_exists if hasattr(firebase_admin, '_app_id_exists') else not firebase_admin._apps):
     try:
         firebase_admin.initialize_app(cred, {
-            'databaseURL': 'https://frends-v3-default-rtdb.asia-southeast1.firebasedatabase.app/' 
+            'databaseURL': 'https://frends-v3-default-rtdb.asia-southeast1.firebasedatabase.app/'
         })
         print("🔥 Firebase Admin initialized successfully!")
     except Exception as e:
         print(f"❌ CRITICAL: Failed to initialize Firebase: {e}")
 
-app = Flask(__name__)
+app = Flask(_name_)
 
-# 🌟 FULL CORS ENABLED TO FIX LOCALHOST:5173 NETWORK/CORS BLOCK
+# Full CORS enabled for localhost and production frontends
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Initialize the routing engine
@@ -38,9 +40,18 @@ TOMTOM_API_KEY = os.environ.get("TOMTOM_API_KEY")
 # Metro Manila Bounding Box
 METRO_MANILA_BOUNDS = (120.90, 14.35, 121.15, 14.77)
 
+
 def is_within_metro_manila(lat, lon):
     min_lon, min_lat, max_lon, max_lat = METRO_MANILA_BOUNDS
     return (min_lat <= lat <= max_lat) and (min_lon <= lon <= max_lon)
+
+
+def _normalize_dict(raw):
+    if isinstance(raw, list):
+        return {str(i): v for i, v in enumerate(raw) if v is not None}
+    if isinstance(raw, dict):
+        return dict(raw)
+    return {}
 
 
 def setup_firebase_listeners():
@@ -48,14 +59,16 @@ def setup_firebase_listeners():
     def flood_stream_handler(event):
         if event.data and isinstance(event.data, dict):
             for node_id, node_data in event.data.items():
-                if all(k in node_data for k in ("lat", "lon", "depth")):
+                if isinstance(node_data, dict) and any(k in node_data for k in ("lat", "lon", "lng", "depth", "waterLevel")):
                     print(f"📡 IoT Flood sync received for node {node_id}")
 
     try:
-        db.reference("nodes").listen(flood_stream_handler)
-        print("🛰️ Firebase listeners active.")
+        if firebase_admin._apps:
+            db.reference("nodes").listen(flood_stream_handler)
+            print("🛰️ Firebase listeners active.")
     except Exception as e:
         print(f"⚠️ Could not attach listeners: {e}")
+
 
 threading.Thread(target=setup_firebase_listeners, daemon=True).start()
 
@@ -63,6 +76,7 @@ threading.Thread(target=setup_firebase_listeners, daemon=True).start()
 @app.route("/health", methods=["GET"])
 def health_check():
     return jsonify({"status": "ONLINE", "service": "FRENDS Dynamic Routing", "timestamp": time.time()}), 200
+
 
 @app.route("/ping", methods=["GET"])
 def ping():
@@ -80,20 +94,34 @@ def get_dynamic_route():
         origin_lon = float(data["origin_lon"])
         dest_lat = float(data["dest_lat"])
         dest_lon = float(data["dest_lon"])
-        vehicle_layer = data.get("vehicle_type", "LOW")
+        vehicle_layer = str(data.get("vehicle_type", "LOW")).upper()
+
+        lane_direction = data.get("lane_direction")
+        dest_direction = data.get("dest_direction")
+        user_heading = data.get("user_heading")
+        switch_lane = bool(data.get("switch_lane", False))
+        user_speed = data.get("user_speed")
+
+        # Client-supplied real-time Firebase snapshots (guarantees zero sync lag)
+        client_flood_data = _normalize_dict(data.get("flood_data"))
+        client_reports_data = _normalize_dict(data.get("reports_data"))
 
         # 1. HYBRID ROUTING CHECK (Metro Manila vs OSRM)
         if is_within_metro_manila(origin_lat, origin_lon) and is_within_metro_manila(dest_lat, dest_lon):
-            print("🛣️ Both points in Metro Manila: Using local JIT-CCH engine.")
+            print(f"🛣️ Metro Manila Route | Vehicle: {vehicle_layer} | Lane: {lane_direction}")
 
+            db_flood_data = {}
+            db_reports_data = {}
             try:
-                # 🌟 Fetch both hardware flood nodes AND crowdsourced hazard reports
-                flood_data = db.reference("nodes").get() 
-                reports_data = db.reference("reports").get() 
+                if firebase_admin._apps:
+                    db_flood_data = _normalize_dict(db.reference("nodes").get())
+                    db_reports_data = _normalize_dict(db.reference("reports").get())
             except Exception as e:
-                print(f"⚠️️ Failed to fetch Firebase data for routing: {e}")
-                flood_data = None
-                reports_data = None
+                print(f"⚠️ Failed to fetch Firebase data from Admin SDK: {e}")
+
+            # Merge DB data with client snapshot (client snapshot overrides with freshest UI state)
+            flood_data = {**db_flood_data, **client_flood_data}
+            reports_data = {**db_reports_data, **client_reports_data}
 
             route_result = engine.compute_route(
                 origin_lat=origin_lat,
@@ -103,13 +131,19 @@ def get_dynamic_route():
                 vehicle_layer=vehicle_layer,
                 api_key=TOMTOM_API_KEY,
                 flood_data=flood_data,
-                reports_data=reports_data #  Pass the hazards directly into the math engine
+                reports_data=reports_data,
+                user_heading=user_heading,
+                lane_direction=lane_direction,
+                switch_lane=switch_lane,
+                dest_direction=dest_direction,
+                user_speed=user_speed
             )
 
             if isinstance(route_result, dict) and route_result.get("status") == "error":
                 return jsonify({
-                    "status": "ALERT", 
-                    "message": route_result.get("message", "Destination isolated by floods.")
+                    "status": "ALERT",
+                    "message": route_result.get("message", "Destination isolated by floods."),
+                    "flood_info": route_result.get("flood_info", {})
                 }), 200
 
             if isinstance(route_result, dict):
@@ -119,6 +153,9 @@ def get_dynamic_route():
                     "segments": route_result.get("segments", []),
                     "distance": route_result.get("distance", 0),
                     "time": route_result.get("time", 0),
+                    "lane_bearing": route_result.get("lane_bearing"),
+                    "lane_switched": route_result.get("lane_switched", False),
+                    "flood_info": route_result.get("flood_info", {})
                 }), 200
             else:
                 return jsonify({
@@ -144,7 +181,6 @@ def get_dynamic_route():
                         duration = osrm_data["routes"][0]["duration"]
                         route = [{"latitude": c[1], "longitude": c[0]} for c in osrm_coords]
 
-                        # 🌟 SLICE OSRM ROUTE TO PAINT YELLOW TRAFFIC PATCHES
                         segments, live_duration = engine.build_osrm_segments(osrm_coords, TOMTOM_API_KEY, is_city=False)
                         final_time = live_duration if live_duration > 0 else duration
 
@@ -177,13 +213,12 @@ def get_dynamic_route():
 
 @app.route("/api/hazard/report", methods=["POST"])
 def report_hazard():
-    data = request.get_json()
     try:
         return jsonify({"status": "SUCCESS", "message": "Hazard registered successfully."}), 200
     except Exception as e:
         return jsonify({"status": "ERROR", "message": str(e)}), 500
 
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)

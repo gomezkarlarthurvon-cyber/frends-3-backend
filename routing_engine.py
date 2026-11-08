@@ -14,10 +14,12 @@ class FRENDSRoutingEngine:
     # --- Lane / carriageway recognition ---------------------------------
     LANE_TOLERANCE_DEG = 65.0                    # max angle between a road segment and a lane bound
     UTURN_PENALTY_S = 1800.0                     # in-place reversal (real crossovers cost far less, see turn penalty)
-    LANE_SNAP_STEPS_DEG = (0.0005, 0.0015, 0.004)  # ~55 m, ~165 m, ~440 m search boxes for lane snapping
-    ALONG_EDGE_SLACK_M = 25.0                    # GPS noise allowance before we treat the start node as "already passed"
+    LANE_SNAP_STEPS_DEG = (0.0005, 0.0012)       # ~55 m, ~130 m search boxes for lane snapping
+    MAX_LANE_SNAP_DIST_M = 65.0                  # never snap to a lane >65 m away from the pin
+    MAX_ENDPOINT_SNAP_DIST_M = 120.0             # if a pin is >120 m from ANY road in metro_manila.db, offload to OSRM!
+    ALONG_EDGE_SLACK_M = 15.0                    # GPS noise allowance near intersection nodes
     MIN_HEADING_SPEED_MPS = 1.5                  # below this a GPS heading is noise, not a direction of travel
-    AUTO_LANE_SNAP_MAX_M = 80.0                  # auto lane choice only considers carriageways this close to the origin
+    AUTO_LANE_SNAP_MAX_M = 65.0                  # auto lane choice only considers carriageways this close to the origin
 
     # Official MMDA flood passability thresholds (Table 1). Depth >= threshold is IMPASSABLE.
     #   >= 13 in (33.02 cm): sedans/hatchbacks (LOW)   >= 19 in (48.26 cm): SUVs (MID)   >= 26 in (66.04 cm): trucks/buses (HIGH)
@@ -184,22 +186,38 @@ class FRENDSRoutingEngine:
         return None
 
     @staticmethod
-    def orient_geometry(geometry, u_lat, u_lon, v_lat, v_lon):
+    def _normalize_coord_pair(pt):
+        if isinstance(pt, dict):
+            lat = float(pt.get("lat", pt.get("latitude", 0)))
+            lon = float(pt.get("lon", pt.get("lng", pt.get("longitude", 0))))
+            return [lon, lat]
+        a, b = float(pt[0]), float(pt[1])
+        if abs(a) < 90.0 and abs(b) > 90.0:
+            return [b, a]
+        return [a, b]
+
+    @classmethod
+    def orient_geometry(cls, geometry, u_lat, u_lon, v_lat, v_lon):
         """Make sure an edge polyline ([lon, lat] points) runs u -> v.
         A reversed polyline makes every per-segment bearing point the wrong way, which flips
         NB/SB matching for floods, hazards and snapping."""
         if not geometry or len(geometry) < 2:
-            return geometry
+            return [[u_lon, u_lat], [v_lon, v_lat]]
         try:
-            first, last = geometry[0], geometry[-1]
-            hav = FRENDSRoutingEngine.haversine_distance
+            norm = [cls._normalize_coord_pair(p) for p in geometry]
+            first, last = norm[0], norm[-1]
+            hav = cls.haversine_distance
             as_is = hav(u_lat, u_lon, first[1], first[0]) + hav(v_lat, v_lon, last[1], last[0])
             flipped = hav(v_lat, v_lon, first[1], first[0]) + hav(u_lat, u_lon, last[1], last[0])
             if flipped < as_is:
-                return list(reversed(geometry))
+                norm = list(reversed(norm))
+            if hav(u_lat, u_lon, norm[0][1], norm[0][0]) > 5.0:
+                norm.insert(0, [u_lon, u_lat])
+            if hav(v_lat, v_lon, norm[-1][1], norm[-1][0]) > 5.0:
+                norm.append([v_lon, v_lat])
+            return norm
         except (TypeError, IndexError, ValueError):
-            pass
-        return geometry
+            return [[u_lon, u_lat], [v_lon, v_lat]]
 
     def _edge_polyline(self, geometry, u_lat, u_lon, v_lat, v_lon):
         """Parse a stored geometry (JSON text or list) into a u -> v oriented [lon, lat] polyline."""
@@ -209,8 +227,6 @@ class FRENDSRoutingEngine:
                 data = json.loads(geometry) if isinstance(geometry, (str, bytes)) else geometry
             except Exception:
                 data = None
-        if not data or len(data) < 2:
-            return [[u_lon, u_lat], [v_lon, v_lat]]
         return self.orient_geometry(data, u_lat, u_lon, v_lat, v_lon)
 
     def heading_change_penalty(self, heading_in, heading_out):
@@ -233,73 +249,100 @@ class FRENDSRoutingEngine:
 
     def _snap_to_lane(self, lat, lon, cursor, target_bearing, prefer="ahead", max_dist=None):
         """Snap a GPS point onto the nearest road segment that flows in `target_bearing`.
-
-        Works on the real (oriented) edge geometry and perpendicular distance, and widens the
-        search box in steps. Uses a two-tier angular tolerance (65°, then 90° hemisphere fallback)
-        so diagonal avenues still snap cleanly to NB/SB carriageways."""
+        Capped at MAX_LANE_SNAP_DIST_M (65m) so it never snaps to a street blocks away."""
+        cap = min(max_dist, self.MAX_LANE_SNAP_DIST_M) if max_dist is not None else self.MAX_LANE_SNAP_DIST_M
         steps = self.LANE_SNAP_STEPS_DEG
-        if max_dist is not None:   # one box just big enough for the cap is all we need
-            steps = (next((d for d in steps if d * 111000.0 >= max_dist), steps[-1]),)
 
-        for tol in (self.LANE_TOLERANCE_DEG, 90.0):
-            for delta in steps:
-                box = (lat - delta, lat + delta, lon - delta, lon + delta)
-                cursor.execute(
-                    """
-                    SELECT e.u, e.v, n1.lat, n1.lon, n2.lat, n2.lon, e.geometry
-                    FROM edges e
-                    JOIN nodes n1 ON e.u = n1.id
-                    JOIN nodes n2 ON e.v = n2.id
-                    WHERE (n1.lat BETWEEN ? AND ? AND n1.lon BETWEEN ? AND ?)
-                       OR (n2.lat BETWEEN ? AND ? AND n2.lon BETWEEN ? AND ?)
-                    """,
-                    box + box
-                )
+        for delta in steps:
+            box = (lat - delta, lat + delta, lon - delta, lon + delta)
+            cursor.execute(
+                """
+                SELECT e.u, e.v, n1.lat, n1.lon, n2.lat, n2.lon, e.geometry
+                FROM edges e
+                JOIN nodes n1 ON e.u = n1.id
+                JOIN nodes n2 ON e.v = n2.id
+                WHERE (n1.lat BETWEEN ? AND ? AND n1.lon BETWEEN ? AND ?)
+                   OR (n2.lat BETWEEN ? AND ? AND n2.lon BETWEEN ? AND ?)
+                """,
+                box + box
+            )
 
-                best, best_score = None, float("inf")
-                for u_id, v_id, u_lat, u_lon, v_lat, v_lon, geom in cursor.fetchall():
-                    polyline = self._edge_polyline(geom, u_lat, u_lon, v_lat, v_lon)
-                    seg_lengths = [
-                        self.haversine_distance(polyline[i][1], polyline[i][0], polyline[i + 1][1], polyline[i + 1][0])
-                        for i in range(len(polyline) - 1)
-                    ]
-                    total = sum(seg_lengths)
-                    travelled = 0.0
-                    for i, seg_len in enumerate(seg_lengths):
-                        lon1, lat1 = polyline[i][0], polyline[i][1]
-                        lon2, lat2 = polyline[i + 1][0], polyline[i + 1][1]
-                        if seg_len > 0:
-                            seg_bearing = self.calculate_heading(lat1, lon1, lat2, lon2)
-                            angle_diff = abs((seg_bearing - target_bearing + 180) % 360 - 180)
-                            if angle_diff <= tol:
-                                dist, t = self.project_point_on_segment(lon, lat, lon1, lat1, lon2, lat2)
+            best, best_score = None, float("inf")
+            for u_id, v_id, u_lat, u_lon, v_lat, v_lon, geom in cursor.fetchall():
+                polyline = self._edge_polyline(geom, u_lat, u_lon, v_lat, v_lon)
+                seg_lengths = [
+                    self.haversine_distance(polyline[i][1], polyline[i][0], polyline[i + 1][1], polyline[i + 1][0])
+                    for i in range(len(polyline) - 1)
+                ]
+                total = sum(seg_lengths)
+                travelled = 0.0
+                for i, seg_len in enumerate(seg_lengths):
+                    lon1, lat1 = polyline[i][0], polyline[i][1]
+                    lon2, lat2 = polyline[i + 1][0], polyline[i + 1][1]
+                    if seg_len > 0:
+                        seg_bearing = self.calculate_heading(lat1, lon1, lat2, lon2)
+                        angle_diff = abs((seg_bearing - target_bearing + 180) % 360 - 180)
+                        if angle_diff <= self.LANE_TOLERANCE_DEG:
+                            dist, t = self.project_point_on_segment(lon, lat, lon1, lat1, lon2, lat2)
+                            if dist <= cap:
                                 score = dist + 0.4 * angle_diff     # prefer close AND well-aligned
-                                if (max_dist is None or dist <= max_dist) and score < best_score:
+                                if score < best_score:
                                     best_score = score
                                     best = (u_id, v_id, travelled + t * seg_len, total)
-                        travelled += seg_len
+                    travelled += seg_len
 
-                if best is not None:
-                    u_id, v_id, along, total = best
-                    if prefer == "nearest":
-                        return u_id if along <= total / 2.0 else v_id
-                    # "ahead": the vehicle can't drive back to u, so start from v unless it is basically still at u
-                    return u_id if along <= self.ALONG_EDGE_SLACK_M else v_id
+            if best is not None:
+                u_id, v_id, along, total = best
+                if prefer == "nearest":
+                    return u_id if along <= total / 2.0 else v_id
+                # Start at u_id so edge (u -> v) is traversed and checked for floods!
+                return v_id if (total - along) <= self.ALONG_EDGE_SLACK_M else u_id
+        return None
+
+    def _snap_to_nearest_edge_node(self, lat, lon, cursor, prefer="nearest"):
+        """Project a pin onto the closest actual road segment within MAX_ENDPOINT_SNAP_DIST_M (120m)."""
+        for delta in (0.0005, 0.0012):
+            box = (lat - delta, lat + delta, lon - delta, lon + delta)
+            cursor.execute(
+                """
+                SELECT e.u, e.v, n1.lat, n1.lon, n2.lat, n2.lon, e.geometry
+                FROM edges e
+                JOIN nodes n1 ON e.u = n1.id
+                JOIN nodes n2 ON e.v = n2.id
+                WHERE (n1.lat BETWEEN ? AND ? AND n1.lon BETWEEN ? AND ?)
+                   OR (n2.lat BETWEEN ? AND ? AND n2.lon BETWEEN ? AND ?)
+                """,
+                box + box
+            )
+            best, best_dist = None, float("inf")
+            for u_id, v_id, u_lat, u_lon, v_lat, v_lon, geom in cursor.fetchall():
+                polyline = self._edge_polyline(geom, u_lat, u_lon, v_lat, v_lon)
+                seg_lengths = [
+                    self.haversine_distance(polyline[i][1], polyline[i][0], polyline[i + 1][1], polyline[i + 1][0])
+                    for i in range(len(polyline) - 1)
+                ]
+                total = sum(seg_lengths)
+                travelled = 0.0
+                for i, seg_len in enumerate(seg_lengths):
+                    lon1, lat1 = polyline[i][0], polyline[i][1]
+                    lon2, lat2 = polyline[i + 1][0], polyline[i + 1][1]
+                    if seg_len > 0:
+                        dist, t = self.project_point_on_segment(lon, lat, lon1, lat1, lon2, lat2)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best = (u_id, v_id, travelled + t * seg_len, total)
+                    travelled += seg_len
+            if best is not None and best_dist <= self.MAX_ENDPOINT_SNAP_DIST_M:
+                u_id, v_id, along, total = best
+                if prefer == "ahead":
+                    return v_id if (total - along) <= self.ALONG_EDGE_SLACK_M else u_id
+                return u_id if along <= total / 2.0 else v_id
         return None
 
     def origin_candidates(self, lat, lon, cursor, lane_bearing=None, dest=None):
-        """Ordered start options as [(node_id, start_bearing), ...].
-
-        Lane known (user request / moving GPS heading):
-          1. the lane the vehicle is in / the user asked for
-          2. the opposite lane            (used when the requested lane is dead-ended, e.g. by a flood)
-          3. nearest node, lane-agnostic  (last resort)
-        No lane known (pinned place, searched address, stationary GPS) -> "auto":
-          the nearest node plus the carriageways heading TOWARD and AWAY from the destination.
-          None carries a start bearing, so nothing forces a loop around the block, and
-          compute_route keeps whichever start gives the fastest trip."""
+        """Ordered start options as [(node_id, start_bearing), ...]."""
         if lane_bearing is None:
-            plain = self.nearest_node_sql(lat, lon, cursor)
+            plain = self.nearest_node_sql(lat, lon, cursor, prefer="nearest")
             candidates = [(plain, None)] if plain is not None else []
             if dest is not None:
                 toward = self.calculate_heading(lat, lon, dest[0], dest[1])
@@ -324,23 +367,37 @@ class FRENDSRoutingEngine:
             add(self._snap_to_lane(lat, lon, cursor, opposite), opposite)
         except (sqlite3.Error, TypeError, ValueError):
             pass
-        add(self.nearest_node_sql(lat, lon, cursor), None)
+        add(self.nearest_node_sql(lat, lon, cursor, prefer="nearest"), None)
         return candidates
 
     def resolve_endpoints(self, origin_lat, origin_lon, dest_lat, dest_lon, lane_bearing=None, dest_bearing=None):
         conn = sqlite3.connect(self.db_file)
         cursor = conn.cursor()
         try:
+            # 🌟 COVERAGE CHECK: Verify both pins actually lie within 120m of a road in metro_manila.db.
+            # If either pin is in Cavite or outside the local DB's roads, return ([], None) so OSRM handles it!
+            cursor.execute(
+                "SELECT lat, lon FROM nodes WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?",
+                (origin_lat - 0.0015, origin_lat + 0.0015, origin_lon - 0.0015, origin_lon + 0.0015)
+            )
+            if not any(self.haversine_distance(origin_lat, origin_lon, float(r[0]), float(r[1])) <= self.MAX_ENDPOINT_SNAP_DIST_M for r in cursor.fetchall()):
+                return [], None
+
+            cursor.execute(
+                "SELECT lat, lon FROM nodes WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?",
+                (dest_lat - 0.0015, dest_lat + 0.0015, dest_lon - 0.0015, dest_lon + 0.0015)
+            )
+            if not any(self.haversine_distance(dest_lat, dest_lon, float(r[0]), float(r[1])) <= self.MAX_ENDPOINT_SNAP_DIST_M for r in cursor.fetchall()):
+                return [], None
+
             sources = self.origin_candidates(origin_lat, origin_lon, cursor, lane_bearing, dest=(dest_lat, dest_lon))
-            target = self.nearest_node_sql(dest_lat, dest_lon, cursor, user_heading=dest_bearing, prefer="nearest")
+            target = self.nearest_node_sql(dest_lat, dest_lon, cursor, user_heading=None, prefer="nearest")
             return sources, target
         finally:
             cursor.close()
             conn.close()
 
     def nearest_node_sql(self, lat, lon, cursor, user_heading=None, prefer="ahead"):
-        # user_heading may be degrees OR a bound ("NB", "southbound", ...). It used to go through
-        # float() only, so any bound string silently disabled lane matching.
         target_bearing = self.parse_lane_direction(user_heading)
         if target_bearing is not None:
             try:
@@ -350,25 +407,26 @@ class FRENDSRoutingEngine:
             except (sqlite3.Error, TypeError, ValueError):
                 pass
 
-        # Standard fallback when stationary, no lane matched, or planning a route manually
-        delta = 0.05
+        edge_node = self._snap_to_nearest_edge_node(lat, lon, cursor, prefer=prefer)
+        if edge_node is not None:
+            return edge_node
+
+        # Only search within ~150m (0.0015 deg). NEVER search the whole database kms away!
+        delta = 0.0015
         cursor.execute(
             """
-            SELECT id FROM nodes
+            SELECT id, lat, lon FROM nodes
             WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?
             ORDER BY ((lat - ?) * (lat - ?)) + ((lon - ?) * (lon - ?)) ASC LIMIT 1
             """,
             (lat - delta, lat + delta, lon - delta, lon + delta, lat, lat, lon, lon)
         )
         result = cursor.fetchone()
-        if result: return result[0]
-
-        cursor.execute(
-            "SELECT id FROM nodes ORDER BY ((lat - ?) * (lat - ?)) + ((lon - ?) * (lon - ?)) ASC LIMIT 1",
-            (lat, lat, lon, lon)
-        )
-        result = cursor.fetchone()
-        return result[0] if result else None
+        if result:
+            n_id, n_lat, n_lon = result
+            if self.haversine_distance(lat, lon, float(n_lat), float(n_lon)) <= self.MAX_ENDPOINT_SNAP_DIST_M:
+                return n_id
+        return None
 
     # Accepts dynamic buffer radius for the expansion strategy + optional user_heading
     def load_local_graph(self, origin_lat, origin_lon, dest_lat, dest_lon, buffer_radius, user_heading=None,
@@ -386,7 +444,7 @@ class FRENDSRoutingEngine:
             if origin_node is None:
                 origin_node = self.nearest_node_sql(origin_lat, origin_lon, cursor, user_heading=user_heading)
             if destination_node is None:
-                destination_node = self.nearest_node_sql(dest_lat, dest_lon, cursor, user_heading=dest_heading, prefer="nearest")
+                destination_node = self.nearest_node_sql(dest_lat, dest_lon, cursor, user_heading=None, prefer="nearest")
 
             if origin_node is None or destination_node is None:
                 return None, None, None
@@ -409,14 +467,21 @@ class FRENDSRoutingEngine:
             edges = []
             for u, v, length, time_value, geometry in cursor:
                 if u not in nodes or v not in nodes: continue
-                try: geometry_data = json.loads(geometry) if geometry else None
-                except Exception: geometry_data = None
-                if geometry_data:
-                    geometry_data = self.orient_geometry(
-                        geometry_data, nodes[u][0], nodes[u][1], nodes[v][0], nodes[v][1])
+                geometry_data = self._edge_polyline(
+                    geometry, nodes[u][0], nodes[u][1], nodes[v][0], nodes[v][1]
+                )
 
                 edge_length = float(length or 0)
+                if edge_length <= 0:
+                    edge_length = self.haversine_distance(nodes[u][0], nodes[u][1], nodes[v][0], nodes[v][1])
+
                 edge_time = float(time_value or 0)
+                if edge_time <= 0:
+                    edge_time = edge_length / self.DEFAULT_SPEED_MPS
+
+                straight_dist = self.haversine_distance(nodes[u][0], nodes[u][1], nodes[v][0], nodes[v][1])
+                if straight_dist > 250.0 and len(geometry_data) <= 2 and edge_length < straight_dist * 0.8:
+                    continue
 
                 # 🏎️ EXPRESSWAY MAGNET: 
                 # If base speed >= 15 m/s (approx 54 km/h), it is a major highway.
@@ -462,12 +527,7 @@ class FRENDSRoutingEngine:
 
     @classmethod
     def _read_flood_node(cls, container):
-        """Return (lat, lon, depth_cm, lane) for one Firebase node, or None.
-
-        Handles flat nodes, push-key histories (latest entry wins) and the field aliases the
-        app/IoT firmware use (lat/lng/lon/latitude, waterLevel/water_level/depth/level).
-        If the latest push entry has no coordinates, the node's own lat/lng is used -
-        the old code skipped such nodes, so a flood shown on the map never blocked a road."""
+        """Return (lat, lon, depth_cm, lane) for one Firebase node, or None."""
         if not isinstance(container, dict):
             return None
         push_keys = sorted(k for k in container if str(k).startswith("-") and isinstance(container[k], dict))
@@ -523,10 +583,6 @@ class FRENDSRoutingEngine:
         if not flood_points:
             return flooded_edges
 
-        # Blast radius: the original tight 15 m, so a flood blocks its own intersection WITHOUT bleeding
-        # over and cutting the safe parallel streets. Only a flood pinned off the road (nearest lane-matched
-        # road farther than 15 m, which the old fixed radius missed entirely) reaches out to the road,
-        # up to MAX_R, so it still blocks something.
         BLAST_RADIUS, MAX_R, SLACK = self.FLOOD_BLAST_RADIUS_M, self.FLOOD_OFFROAD_REACH_M, 4.0
         nearest = [float("inf")] * len(flood_points)
         hits = []  # (edge, flood_index, distance)
@@ -544,8 +600,8 @@ class FRENDSRoutingEngine:
             for fi, (flood_lat, flood_lon, lane_dir) in enumerate(flood_points):
                 best = float("inf")
                 for i in range(len(geometry) - 1):
-                    lon1, lat1 = geometry[i]
-                    lon2, lat2 = geometry[i + 1]
+                    lon1, lat1 = geometry[i][0], geometry[i][1]
+                    lon2, lat2 = geometry[i + 1][0], geometry[i + 1][1]
                     dist = self.point_to_line_distance(flood_lon, flood_lat, lon1, lat1, lon2, lat2)
                     if dist > MAX_R or dist >= best:
                         continue
@@ -637,8 +693,8 @@ class FRENDSRoutingEngine:
             for hazard_lat, hazard_lon, penalty, lane_dir in active_hazards:
                 if penalty <= edge_penalty: continue
                 for i in range(len(geometry) - 1):
-                    lon1, lat1 = geometry[i]
-                    lon2, lat2 = geometry[i + 1]
+                    lon1, lat1 = geometry[i][0], geometry[i][1]
+                    lon2, lat2 = geometry[i + 1][0], geometry[i + 1][1]
                     dist = self.point_to_line_distance(hazard_lon, hazard_lat, lon1, lat1, lon2, lat2)
                     if dist <= self.HAZARD_RADIUS_M:
                         seg_bearing = self.calculate_heading(lat1, lon1, lat2, lon2) if (lat1 != lat2 or lon1 != lon2) else edge_bearing
@@ -673,7 +729,13 @@ class FRENDSRoutingEngine:
 
                 if u == w or u in contracted or w in contracted: continue
 
-                shortcut_time = in_edge["time"] + out_edge["time"]
+                first_u = in_edge.get("last_u", in_edge["u"])
+                next_w = out_edge.get("first_v", out_edge["v"])
+                internal_turn_penalty = self.get_turn_penalty(first_u, node, next_w, nodes)
+                if internal_turn_penalty >= self.UTURN_PENALTY_S:
+                    continue
+
+                shortcut_time = in_edge["time"] + out_edge["time"] + internal_turn_penalty
                 geom_in = in_edge.get("geometry") or [[nodes[in_edge["u"]][1], nodes[in_edge["u"]][0]], [nodes[in_edge["v"]][1], nodes[in_edge["v"]][0]]]
                 geom_out = out_edge.get("geometry") or [[nodes[out_edge["u"]][1], nodes[out_edge["u"]][0]], [nodes[out_edge["v"]][1], nodes[out_edge["v"]][0]]]
                 
@@ -711,22 +773,25 @@ class FRENDSRoutingEngine:
             u_lat, u_lon = nodes[u]
             return (self.haversine_distance(u_lat, u_lon, target_lat, target_lon) / 22.2) 
 
+        start_state = (source, None)
         queue = [(heuristic(source), 0.0, source, None, None)]
-        visited = {source: (0.0, None, None)}
+        visited = {start_state: 0.0}
+        parent_map = {}
 
         while queue:
             f_score, current_time, u, prev_u, prev_edge = heapq.heappop(queue)
 
             if u == target:
                 path_edges = []
-                curr = u
-                while curr != source:
-                    _, parent, e = visited[curr]
+                curr_state = (u, prev_u)
+                while curr_state in parent_map:
+                    prev_state, e = parent_map[curr_state]
                     path_edges.append(e)
-                    curr = parent
+                    curr_state = prev_state
                 return current_time, path_edges[::-1]
 
-            if current_time > visited.get(u, (float('inf'), None, None))[0]:
+            state = (u, prev_u)
+            if current_time > visited.get(state, float('inf')):
                 continue
 
             for edge in graph.get(u, []):
@@ -750,8 +815,10 @@ class FRENDSRoutingEngine:
                     in_heading = self.calculate_heading(nodes[last_u][0], nodes[last_u][1], nodes[v][0], nodes[v][1])
                     new_time += self.heading_change_penalty(in_heading, dest_bearing)
 
-                if new_time < visited.get(v, (float('inf'), None, None))[0]:
-                    visited[v] = (new_time, u, edge)
+                next_state = (v, u)
+                if new_time < visited.get(next_state, float('inf')):
+                    visited[next_state] = new_time
+                    parent_map[next_state] = (state, edge)
                     f = new_time + heuristic(v)
                     heapq.heappush(queue, (f, new_time, v, u, edge))
 
@@ -827,7 +894,57 @@ class FRENDSRoutingEngine:
             total_duration += (dist / base_speed) * multiplier
         return segments, total_duration
 
-    def build_route_payload(self, nodes, route_edges, api_key):
+    @classmethod
+    def _trim_polyline_to_pins(cls, coords, origin_lat, origin_lon, dest_lat, dest_lon):
+        """Trim the start and end of the route coordinate list to the exact projection of the
+        origin and destination pins along the first/last street segments."""
+        if not coords or len(coords) < 2:
+            return coords
+
+        best_i, best_t, best_d, acc = 0, 0.0, float("inf"), 0.0
+        for i in range(len(coords) - 1):
+            lat1, lon1 = coords[i]["latitude"], coords[i]["longitude"]
+            lat2, lon2 = coords[i + 1]["latitude"], coords[i + 1]["longitude"]
+            d, t = cls.project_point_on_segment(origin_lon, origin_lat, lon1, lat1, lon2, lat2)
+            if d < best_d:
+                best_d, best_i, best_t = d, i, t
+            acc += cls.haversine_distance(lat1, lon1, lat2, lon2)
+            if acc > 250.0:
+                break
+        if best_d <= 80.0:
+            lat1, lon1 = coords[best_i]["latitude"], coords[best_i]["longitude"]
+            lat2, lon2 = coords[best_i + 1]["latitude"], coords[best_i + 1]["longitude"]
+            proj_start = {
+                "latitude": lat1 + best_t * (lat2 - lat1),
+                "longitude": lon1 + best_t * (lon2 - lon1)
+            }
+            coords = [proj_start] + coords[best_i + 1:]
+
+        if len(coords) < 2:
+            return coords
+
+        best_i, best_t, best_d, acc = len(coords) - 2, 1.0, float("inf"), 0.0
+        for i in range(len(coords) - 2, -1, -1):
+            lat1, lon1 = coords[i]["latitude"], coords[i]["longitude"]
+            lat2, lon2 = coords[i + 1]["latitude"], coords[i + 1]["longitude"]
+            d, t = cls.project_point_on_segment(dest_lon, dest_lat, lon1, lat1, lon2, lat2)
+            if d < best_d:
+                best_d, best_i, best_t = d, i, t
+            acc += cls.haversine_distance(lat1, lon1, lat2, lon2)
+            if acc > 250.0:
+                break
+        if best_d <= 80.0:
+            lat1, lon1 = coords[best_i]["latitude"], coords[best_i]["longitude"]
+            lat2, lon2 = coords[best_i + 1]["latitude"], coords[best_i + 1]["longitude"]
+            proj_end = {
+                "latitude": lat1 + best_t * (lat2 - lat1),
+                "longitude": lon1 + best_t * (lon2 - lon1)
+            }
+            coords = coords[:best_i + 1] + [proj_end]
+
+        return coords
+
+    def build_route_payload(self, nodes, route_edges, api_key, origin=None, dest=None):
         route_coords = []
         total_distance = 0.0
 
@@ -847,10 +964,15 @@ class FRENDSRoutingEngine:
 
         cleaned_coords, previous = [], None
         for point in route_coords:
-            current = (point["latitude"], point["longitude"])
+            current = (round(point["latitude"], 6), round(point["longitude"], 6))
             if current == previous: continue
             cleaned_coords.append(point)
             previous = current
+
+        if origin is not None and dest is not None:
+            cleaned_coords = self._trim_polyline_to_pins(
+                cleaned_coords, origin[0], origin[1], dest[0], dest[1]
+            )
 
         osrm_format_coords = [[p["longitude"], p["latitude"]] for p in cleaned_coords]
         route_segments, live_total_time = self.build_osrm_segments(osrm_format_coords, api_key, is_city=True)
@@ -864,17 +986,19 @@ class FRENDSRoutingEngine:
         }
         
     def fetch_osrm_fallback(self, origin_lat, origin_lon, dest_lat, dest_lon, api_key):
-        print(f"⚠️ Out of Bounds: Delegating {origin_lat},{origin_lon} -> {dest_lat},{dest_lon} to OSRM Fallback...")
-        # Standard OSRM public API endpoint for driving routes
-        url = f"http://router.project-osrm.org/route/v1/driving/{origin_lon},{origin_lat};{dest_lon},{dest_lat}?overview=full&geometries=geojson"
+        print(f"🌐 Out of local DB coverage: Delegating {origin_lat},{origin_lon} -> {dest_lat},{dest_lon} to OSRM...")
+        # HTTPS + User-Agent header prevents OSRM public API blocks
+        url = f"https://router.project-osrm.org/route/v1/driving/{origin_lon},{origin_lat};{dest_lon},{dest_lat}?overview=full&geometries=geojson"
+        headers = {"User-Agent": "FRENDS-Research-Project/1.0"}
         
         try:
-            response = requests.get(url, timeout=5.0)
+            response = requests.get(url, headers=headers, timeout=10.0)
             if response.status_code == 200:
                 data = response.json()
                 if data.get("code") == "Ok":
                     route = data["routes"][0]
                     total_distance = route["distance"]
+                    duration = route["duration"]
                     
                     # OSRM returns GeoJSON format: [longitude, latitude]
                     coordinates = route["geometry"]["coordinates"]
@@ -891,7 +1015,7 @@ class FRENDSRoutingEngine:
                         "path": cleaned_coords,
                         "segments": route_segments,
                         "distance": float(total_distance),
-                        "time": float(live_total_time)
+                        "time": float(live_total_time if live_total_time > 0 else duration)
                     }
         except Exception as e:
             print(f"🚨 OSRM Fallback encountered an error: {e}")
@@ -902,10 +1026,7 @@ class FRENDSRoutingEngine:
     # FLOOD-AWARE START / END POINTS
     # ------------------------------------------------------------------
     def _stub_hits_flood(self, p_lat, p_lon, n_lat, n_lon, zones):
-        """True if the short piece of road between a pin and the graph node it snaps to crosses a flood.
-        The graph only contains whole edges, so a flood on the partial stretch between the pin and its
-        junction used to be invisible: the flooded edge was removed, the route simply started (or ended)
-        on the far side of it, and the drawn line cut straight through the water."""
+        """True if the short piece of road between a pin and the graph node it snaps to crosses a flood."""
         bearing = self.calculate_heading(p_lat, p_lon, n_lat, n_lon) if (p_lat != n_lat or p_lon != n_lon) else None
         for z_lat, z_lon, lane, radius in zones:
             if self.point_to_line_distance(z_lon, z_lat, p_lon, p_lat, n_lon, n_lat) <= radius:
@@ -913,10 +1034,9 @@ class FRENDSRoutingEngine:
                     return True
         return False
 
-    def _clear_endpoint_candidates(self, lat, lon, nodes, base, zones, max_extra=8, radius_m=700.0):
+    def _clear_endpoint_candidates(self, lat, lon, nodes, base, zones, max_extra=4, radius_m=90.0):
         """base: [(node_id, bearing)] chosen by lane snapping. Drop those whose stub crosses a flood and
-        append the nearest other junctions (any direction => the vehicle may turn around) whose stub is clear.
-        If everything is flooded (the pin itself is in the water) the original list is returned unchanged."""
+        append the nearest other junctions within 90m whose stub is clear."""
         if not zones:
             return [(n, b) for n, b in base if n in nodes]
         kept = [(n, b) for n, b in base
@@ -1035,7 +1155,7 @@ class FRENDSRoutingEngine:
             try:
                 zones = getattr(self, "last_flood_zones", [])
                 active = self._clear_endpoint_candidates(origin_lat, origin_lon, nodes, sources, zones)
-                targets = self._clear_endpoint_candidates(dest_lat, dest_lon, nodes, [(target, dest_bearing)], zones, max_extra=6)
+                targets = self._clear_endpoint_candidates(dest_lat, dest_lon, nodes, [(target, None)], zones, max_extra=3, radius_m=75.0)
                 if not active or not targets:
                     raise KeyError("Start or destination lies outside the local graph")
 
@@ -1049,7 +1169,7 @@ class FRENDSRoutingEngine:
                     try:
                         solved = self.query_with_lane_fallback(
                             nodes, cch_edges, active, tgt,
-                            pick_best=(lane_bearing is None or len(active) > 1 and active[0][1] is None),
+                            pick_best=True,
                             origin=(origin_lat, origin_lon), dest_bearing=tgt_bearing
                         )
                         break
@@ -1082,7 +1202,10 @@ class FRENDSRoutingEngine:
             unique_edges.append(edge)
 
         try:
-            result = self.build_route_payload(nodes, unique_edges, api_key)
+            result = self.build_route_payload(
+                nodes, unique_edges, api_key,
+                origin=(origin_lat, origin_lon), dest=(dest_lat, dest_lon)
+            )
             if not result["path"] or len(result["path"]) < 2:
                 return {"status": "error", "message": "Failed to generate a valid route."}
             if not api_key: result["time"] = float(base_time)
